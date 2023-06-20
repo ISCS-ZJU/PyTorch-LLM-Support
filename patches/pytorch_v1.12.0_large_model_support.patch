@@ -1,0 +1,3310 @@
+commit 653cf2a671ab78872aa9b082025691efe075eaeb
+Author: wenjie zhang <wjzhang.ncc@zju.edu.cn>
+Date:   Thu May 18 14:47:52 2023 +0800
+
+    Aync LMS
+
+diff --git a/aten/src/ATen/EntityTensorImpl.cpp b/aten/src/ATen/EntityTensorImpl.cpp
+new file mode 100644
+index 00000000000..86e10f24d8f
+--- /dev/null
++++ b/aten/src/ATen/EntityTensorImpl.cpp
+@@ -0,0 +1,336 @@
++#include <ATen/EntityTensorImpl.h>
++#include <c10/cuda/CUDACachingAllocator.h>
++
++#include <chrono>
++#include <string>
++#include <random>
++#include <cmath>
++
++namespace at {
++
++static std::function<int64_t()> debug_callback = []() -> int64_t { return 0; }; // do nothing
++
++namespace native {
++Tensor checkpoint(const Tensor& t) {
++  auto eti = intrusive_ptr<EntityTensorImpl>::make(t);
++  return Tensor(eti);
++}
++
++Tensor uncheckpoint(const Tensor& t) {
++  return get_entity_tensor_impl(t)->ref_tensor();
++}
++
++Tensor decheckpoint(const Tensor& t) {
++  auto* eti = dynamic_cast<EntityTensorImpl*>(t.unsafeGetTensorImpl());
++  return eti ? eti->ref->value->value->get() : t;
++}
++
++bool is_checkpoint(const Tensor& t) {
++  return dynamic_cast<EntityTensorImpl*>(t.unsafeGetTensorImpl()) != nullptr;
++}
++
++Tensor try_checkpoint(const Tensor& t) {
++  return is_checkpoint(t) ? t : checkpoint(t);
++}
++
++bool evict_checkpoint(const Tensor& t) {
++  if (!is_checkpoint(t)) return false;
++  get_entity_tensor_impl(t)->ref->value->value->evict();
++  return true;
++}
++
++Tensor remat_checkpoint(const Tensor& t) {
++  return is_checkpoint(t) ? get_entity_tensor_impl(t)->ref->value->value->get() : t;
++}
++
++
++bool pageout_manual(const Tensor& t) {
++  t.unsafeGetTensorImpl()->storage().unsafeGetStorageImpl()->pageout_manual();
++  return true;
++}
++
++bool pagein_manual(const Tensor& t) {
++  t.unsafeGetTensorImpl()->storage().unsafeGetStorageImpl()->pagein_manual();
++  return true;
++}
++
++bool need_prefech(const Tensor& t) {
++  t.unsafeGetTensorImpl()->storage().unsafeGetStorageImpl()->need_prefetch();
++  return true;
++}
++
++int64_t get_pointer(const Tensor&t) {
++  return t.unsafeGetTensorImpl()->storage().unsafeGetStorageImpl()->entity().impl_->entity_id_;
++}
++} // namespace native 
++
++[[inline]]
++Tensor uncheckpoint(const Strong& input) {
++  return input->get();
++}
++
++Tensors uncheckpoint(const Strongs& inputs) {
++  Tensors ret;
++  ret.reserve(inputs.size());
++  for (const Strong& input : inputs)
++    // inlined manually
++    ret.push_back(input->get());
++  return ret;
++};
++
++Tensors try_checkpoint(const Tensors& inputs) {
++  Tensors ret;
++  ret.reserve(inputs.size());
++  for (const Tensor& input : inputs)
++    ret.push_back(at::native::try_checkpoint(input));
++  return ret;
++}
++
++void Rematerializer::remat() {
++  // TODO: refactor using RAII for exception safety.
++  for (const Strong& s : inputs)
++    s->pool_->lock();
++  Tensors ts = uncheckpoint(inputs);
++  time_t pre_rematerialize  = std::chrono::system_clock::now();
++  auto ret = func(ts);
++  time_t post_rematerialize = std::chrono::system_clock::now();
++  // pool.auto_evict();
++  // remat_compute_time_ += (post_rematerialize - pre_rematerialize).count();
++  TORCH_CHECK(ret.size() == outputs.size());
++  for (size_t i = 0; i < outputs.size(); ++i)
++    if (auto output_cell = outputs[i].lock())
++      output_cell->fill(ret[i]);
++  // ecn.reset();
++  for (const Strong& s : inputs)
++    s->pool_->unlock();
++}
++
++void AliasPool::set_not_evicted(const intrusive_ptr<AliasPool>& self) {
++  if (unlikely(is_evicted_)) {
++    is_evicted_ = false;
++    // if (ecn) {
++    //   TORCH_CHECK(head_remat);
++    //   auto cpi = get_t(ecn);
++    //   update_t(ecn, CheckpointInfo(cpi.compute_cost - head_remat->compute_cost));
++    //   ecn.reset();
++    // }
++    // pool.add(self);
++  }
++}
++
++size_t EntityTensorCell::memory() {
++  TORCH_CHECK(defined_);
++  return pool_->memory_;
++}
++
++Tensor EntityTensorCell::get() {
++  if (!t_) {
++    TORCH_CHECK(remat_);
++    remat_->remat();
++  }
++  TORCH_CHECK(t_);
++  // TORCH_CHECK(! t->key_set().has(DispatchKey::CheckpointTensorId));
++  pool_->update_last_used(); 
++  return *t_;
++}
++
++void EntityTensorCell::pin() {
++  get();
++  pool_->head_remat_.reset();
++  remat_.reset();
++}
++
++void EntityTensorCell::fill(const Tensor& t) {
++  if (t_) return;
++  t_ = std::make_unique<Tensor>(t.detach());
++  if (!defined_) {
++    defined_ = true;
++    is_undefined_tensor_ = !t.defined();
++    key_set_ = t.key_set();
++    if (t.requires_grad()) {
++      key_set_ = key_set_.add(DispatchKey::Autograd);
++    }
++    dtype_ = t.dtype();
++    optional_device_ = t.optional_device();
++  }
++}
++
++void External::release_resources() {
++  value->pool_->release_external();
++  value.reset();
++}
++
++int EntityTensorImpl::counter = 0;
++
++EntityTensorImpl::EntityTensorImpl(const Ref<intrusive_ptr<External>>& ref) 
++        : TensorImpl(convert_key_set(ref->value->value->key_set()),
++              ref->value->value->dtype(),
++              ref->value->value->optional_device()),
++  ref(ref) {
++  if (key_set().has(DispatchKey::Autograd)) 
++    set_requires_grad(true);
++  set_sizes_strides_policy(SizesStridesPolicy::CustomSizes);
++  enable_remateriazation();
++}
++
++EntityTensorImpl::EntityTensorImpl(const intrusive_ptr<External>& e) 
++        : EntityTensorImpl(Ref<intrusive_ptr<External>>::make(e)) { 
++}
++
++EntityTensorImpl::EntityTensorImpl(const Tensor& t) 
++        : EntityTensorImpl(intrusive_ptr<External>::make(t)) {
++}
++
++intrusive_ptr<TensorImpl> EntityTensorImpl::shallow_copy_and_detach(const VariableVersion& version_counter,
++                                                  bool allow_tensor_metadata_change) const {
++  auto ret = intrusive_ptr<EntityTensorImpl>::make(ref);
++  return ret;
++}
++
++void EntityTensorImpl::shallow_copy_from(const c10::intrusive_ptr<TensorImpl>& impl) {
++  auto* eti = dynamic_cast<EntityTensorImpl*>(impl.get());
++  ref->value = eti->ref->value;
++}
++
++bool is_alias(const Tensor& l, const Tensor& r) {
++  return l.defined() && r.defined() && l.is_alias_of(r);
++}
++
++// return an index for alias.
++// we dont care which one because they all lead to the same alias pool.
++// return -1 for no alias.
++int get_alias(const Tensors& ts, const Tensor& t) {
++  if (!t.defined())
++    for (size_t i = 0; i < ts.size(); ++i)
++      if (ts[i].defined() && t.is_alias_of(ts[i])) return i;
++  return -1;
++}
++
++struct MakeRawResult {
++  std::vector<intrusive_ptr<External>> outputs;
++  std::vector<int> aliases;
++  duration_t time;
++  intrusive_ptr<Rematerializer> rematerializer;
++};
++
++// void add_neighbor(const Strong& l, const Strong& r) {
++//   l->pool_->neighbors.push_back(Weak(r));
++//   r->pool_->neighbors.push_back(Weak(l));
++// }
++
++// remat take a single vector of tensors,
++// while there are two vector, one storing nonconstants and one storing constants.
++// the constants are small and they will not be considered for eviction.
++// however, we have to stitch the two vectors together to pass it in remat.
++// the size_t in constants decide the location to stitch them in, while input_values fill in the rest.
++MakeRawResult make_raw(const RematFunc_t& remat_f,
++                       const Strongs&     inputs) {
++  for (const Strong& s : inputs)
++    s->pool_->lock();
++  Tensors raw_inputs = uncheckpoint(inputs);
++  time_t pre_rematerialize  = std::chrono::system_clock::now();
++  auto raw_outputs = remat_f(raw_inputs);
++  time_t post_rematerialize = std::chrono::system_clock::now();
++  // pool.auto_evict();
++  // base_compute_time_ += (post - pre).count();
++  std::vector<intrusive_ptr<External>>    outputs;
++  std::vector<int>                        aliases;
++  Weaks                                   weak_outputs;
++  auto remat = intrusive_ptr<Rematerializer>::make(Unsafe(), remat_f, inputs, post_rematerialize - pre_rematerialize);
++
++  for (const Tensor& t : raw_outputs) {
++    intrusive_ptr<AliasPool> alias_pool;
++    int alias = get_alias(raw_inputs, t);
++    if (alias == -1) {
++      // auto m = memory(t);
++      alias_pool = intrusive_ptr<AliasPool>::make(Unsafe(), remat, -1);
++      // pool.add(alias_pool)
++    }
++    else {
++      alias_pool = inputs[alias]->pool_;
++      if (alias_pool->head_remat_) {
++        alias_pool->head_remat_->compute_cost += (post_rematerialize - pre_rematerialize);
++      }
++    }
++    auto e = intrusive_ptr<External>::make(t, alias_pool, remat);
++    // pool.exts.push_back(weak_intrusive_ptr<External>(e));
++    alias_pool->tensors_.push_back(Weak(e->value));
++    outputs.push_back(e);
++    aliases.push_back(alias);
++    weak_outputs.push_back(Weak(outputs.back()->value));
++  }
++  remat->outputs = weak_outputs;
++  // for (size_t i = 0; i < inputs.size(); ++i) {
++    // for (size_t j = 0; j < outputs.size(); ++j) {
++      // if (!is_alias(raw_inputs[i], raw_outputs[j])) {
++        // add_neighbor(inputs[i], outputs[j]->value);
++      // }
++    // }
++  // }
++  for (const Strong& s : inputs)
++    s->pool_->unlock();
++  return {outputs, aliases, post_rematerialize - pre_rematerialize, remat};
++}
++
++Tensors EntityTensorImpl::make(const std::string& name,
++                               const RematFunc_t& remat,
++                               const Tensors&     inputs) {
++  Tensors checkpointed_inputs = try_checkpoint(inputs);
++  auto input_size = checkpointed_inputs.size();
++
++  Strongs input_values;
++  input_values.reserve(input_size);
++
++  std::vector<std::string> args;
++  args.reserve(input_size);
++
++  for (const Tensor& t: checkpointed_inputs)
++    input_values.push_back(get_entity_tensor_impl(t)->ref->value->value);
++
++  auto ret = make_raw(remat, input_values);
++
++  Tensors tensors;
++  tensors.reserve(ret.outputs.size());
++
++  for (const auto& t: ret.outputs) {
++    auto cp = Tensor(intrusive_ptr<EntityTensorImpl>::make(t));
++    tensors.push_back(cp);
++  }
++
++  return tensors;
++}
++
++// TODO: check that mutated value does not have alias.
++void EntityTensorImpl::mutate(const std::string& name,
++                                  const MutateFunc_t& mutate,
++                                  const Tensors& inputs,
++                                  const std::vector<size_t>& mutate_idx) {
++  auto remat = [=](const Tensors& t) -> Tensors {
++                 Tensors new_input_values = t;
++                 for (size_t idx: mutate_idx) {
++                   new_input_values[idx] = t[idx].clone();
++                 }
++                 mutate(new_input_values);
++                 return new_input_values;
++               };
++  Tensors checkpointed_inputs = try_checkpoint(inputs);
++  Strongs input_values;
++  std::vector<std::string> args;
++  for (const Tensor& t: checkpointed_inputs)
++    input_values.push_back(get_entity_tensor_impl(t)->ref->value->value);
++
++  auto ret = make_raw(remat, input_values);
++  const auto& modified = ret.outputs;
++  for (size_t idx: mutate_idx) {
++    get_cell_from_tensor(inputs[idx])->value = modified[idx];
++  }
++}
++
++void EntityTensorImpl::release_resources() { 
++  ref.reset(); 
++}
++
++
++void setDebugCallbackFunction(std::function<int64_t()> f_) { debug_callback = f_; }
++
++} // namespace at
+\ No newline at end of file
+diff --git a/aten/src/ATen/EntityTensorImpl.h b/aten/src/ATen/EntityTensorImpl.h
+new file mode 100644
+index 00000000000..4e9f707427f
+--- /dev/null
++++ b/aten/src/ATen/EntityTensorImpl.h
+@@ -0,0 +1,277 @@
++#pragma once
++
++#include <atomic>
++#include <memory>
++#include <numeric>
++#include <random>
++
++#include <c10/core/Backend.h>
++#include <c10/core/MemoryFormat.h>
++#include <c10/core/Storage.h>
++#include <c10/core/TensorOptions.h>
++#include <c10/core/DispatchKeySet.h>
++#include <c10/core/impl/LocalDispatchKeySet.h>
++#include <c10/core/CopyBytes.h>
++
++#include <c10/util/Exception.h>
++#include <c10/util/Optional.h>
++#include <c10/util/Flags.h>
++#include <c10/util/Logging.h>
++#include <c10/util/python_stub.h>
++#include <c10/core/TensorImpl.h>
++#include <ATen/Tensor.h>
++#include <ATen/ATen.h>
++
++#define likely(x)      __builtin_expect(!!(x), 1)
++#define unlikely(x)    __builtin_expect(!!(x), 0)
++// #define TORCH_CHECK(a, ...) // profile mode
++
++namespace at {
++
++template<typename T>
++struct RefCell final : intrusive_ptr_target {
++  mutable T value;
++  void release_resources() final { static_release_resources(value); }
++  RefCell(const T& t) : value(t) { }
++};
++
++template<typename T>
++using Ref = intrusive_ptr<RefCell<T>>;
++
++template<typename T>
++void static_release_resources(intrusive_ptr<T>& ptr) { ptr.reset(); }
++
++class EntityTensorCell;
++using Strong = intrusive_ptr<EntityTensorCell>;
++using Strongs = std::vector<Strong>;
++using Weak = weak_intrusive_ptr<EntityTensorCell>;
++using Weaks = std::vector<Weak>;
++using Tensors = std::vector<Tensor>;
++using RematFunc_t = std::function<Tensors(const Tensors&)>;
++using MutateFunc_t = std::function<void(const Tensors&)>;
++
++using time_t = std::chrono::time_point<std::chrono::system_clock>;
++using duration_t = std::chrono::system_clock::duration;
++
++struct Unsafe { };
++
++// The rematerializer could be called to reinvoke an operator.
++// Tensor point to remat which point to Tensor.
++// To build the cycle remat support a default constructor,
++// And allow you to fill in the member later.
++struct Rematerializer : intrusive_ptr_target {
++  RematFunc_t func;
++  Strongs     inputs;
++  Weaks       outputs;
++  duration_t  compute_cost;
++  // when some output in here get evicted, they should belong to this ecn.
++  // a rematerializer have to track this,
++  // because when multiple output of a rematerializer get evicted,
++  // we only want to count the compute cost once.
++  Rematerializer(const Unsafe&,
++                 const RematFunc_t& func,
++                 const Strongs&     inputs,
++                 duration_t         compute_cost)  :
++          func(func),
++          inputs(inputs),
++          compute_cost(compute_cost) { }
++  void release_resources() final {
++    func = RematFunc_t();
++    inputs.clear();
++    outputs.clear();
++  }
++  void remat();
++};
++
++// Track all Tensor that share the same Storage.
++// This is the atomic level of eviction - when evicting, everything here will get evicted.
++// When an AliasPool is evicted, the Storage of the underlying tensor must be freed.
++// Additionally, the AliasPool contain weak pointer to all children of tensors,
++// in order to compute the score of evicting a Storage.
++struct AliasPool : intrusive_ptr_target {
++  Weaks                         tensors_;
++  Weaks                         neighbors_;
++  // std::set<ecn_ptr> neighbor_ecn();
++  // get() might hold some raw Tensor, rendering them unevictable.
++  // it is likely that get() will run out of memory, and when it does so, it will try to evict.
++  // so, it is crucial that we dont try to evict those tensors - doing so will not evict anything.
++  // lock_count count how many time a tensor is referenced by get.
++  size_t                        lock_count_ = 0;
++  size_t                        external_count_ = 0;
++  size_t lock()   { return ++lock_count_; }
++  size_t unlock() { return --lock_count_; }
++  
++  intrusive_ptr<Rematerializer> head_remat_;
++  bool evictable() const { return lock_count_ == 0 && head_remat_; }
++  // if it is not evictable it must not be evicted.
++  bool                          is_evicted_ = false;
++  size_t                        memory_;
++  time_t                        last_used_;
++  void update_last_used() { last_used_ = std::chrono::system_clock::now();}
++  
++  // An aliaspool cant register itself to the checkpointpool - you have to do it yourself.
++  AliasPool(const Unsafe&, intrusive_ptr<Rematerializer> head_remat, size_t memory) :
++          head_remat_(head_remat),
++          memory_(memory),
++          last_used_(std::chrono::system_clock::now()) { }
++  
++  // if it is evicted, then hold the evicted tensor group.
++  // ecn_ptr ecn;
++  // double cost(time_t current_time);
++  // void evict();
++  void register_external() { ++external_count_; }
++  void release_external()  {
++    --external_count_;
++    if (external_count_ == 0) {
++      if (lock_count_ > 0) return;
++      TORCH_CHECK(lock_count_ == 0);
++      // if (memory_ > 0 && (!ecn) && head_remat) {
++      //   evict();
++      // }
++    }
++  }
++  // if it was evicted, refresh it. otherwise do nothing.
++  // have to check so, because when we rematerialize a single tensor in an aliaspool,
++  // we will set it to non-evicted, and when we rematerialize it's tensor they will also reset this.
++  void set_not_evicted(const intrusive_ptr<AliasPool>& self);
++  void release_resources() final {
++    tensors_.clear();
++    neighbors_.clear();
++    head_remat_.reset();
++  }
++};
++
++struct EntityTensorCell : intrusive_ptr_target {
++  std::unique_ptr<Tensor>       t_;
++  bool                          defined_ = false;
++  bool                          is_undefined_tensor_;
++  DispatchKeySet                key_set_;
++  DispatchKeySet                key_set() const {
++    TORCH_CHECK(defined_);
++    return key_set_;
++  }
++  caffe2::TypeMeta              dtype_;
++  caffe2::TypeMeta              dtype() const {
++    TORCH_CHECK(defined_);
++    return dtype_;
++  }
++  c10::optional<Device>         optional_device_;
++  c10::optional<Device>         optional_device() const {
++    TORCH_CHECK(defined_);
++    return optional_device_;
++  }
++  // A Tensor is evictable iff it's AliasPool is evictable.
++  // A evictable tensor must have Rematerializer.
++  intrusive_ptr<AliasPool>      pool_;
++  intrusive_ptr<Rematerializer> remat_;
++  void     evict() {
++    TORCH_CHECK(remat_);
++    t_.reset();
++  }
++
++  void     fill(const Tensor& t);
++  explicit EntityTensorCell(const Tensor& t, const intrusive_ptr<AliasPool>& pool) 
++          : pool_(pool)                { fill(t); }
++  explicit EntityTensorCell(const Tensor& t,
++                            const intrusive_ptr<AliasPool>& pool,
++                            const intrusive_ptr<Rematerializer>& remat) 
++          : pool_(pool), remat_(remat) { fill(t); }
++  size_t   memory();
++  Tensor   get();
++  void     pin();
++  void     release_resources() final {
++    t_.reset();
++    pool_.reset();
++    remat_.reset();
++  }
++};
++
++
++// An external reference.
++// Each strong will have at most one external reference.
++// By keeping such an invariant, whenever an external reference die,
++// We know that the underlying strong is only used internally.
++// Thus, when it die we can apply optimization like banishing/infinite staleness.
++// We keep this invariant by only allowing EntityTensorImpl to make new External,
++// When new EntityTensorImpl is constructed.
++struct External : intrusive_ptr_target {
++  External(const Strong& value) : value(value) {
++    // value->pool->register_external();
++  }
++  External(const Tensor& value) :
++          External(Strong::make(value, intrusive_ptr<AliasPool>::make(Unsafe(),
++                                                                      intrusive_ptr<Rematerializer>(),
++                                                                      -1))) { }
++  External(const Tensor& value,
++           const intrusive_ptr<AliasPool>& pool,
++           const intrusive_ptr<Rematerializer>& remat) :
++    External(Strong::make(value, pool, remat)) { }
++  Strong value;
++  void release_resources() override;
++};
++
++
++struct EntityTensorImpl : TensorImpl {
++  
++  static int counter;
++  static int gen_counter()          { return counter++; }
++  
++  int                           id_ = gen_counter();
++  std::string counter_name() const  { return std::string("[ETI") + std::to_string(id_) + "]"; }
++
++  Ref<intrusive_ptr<External>>  ref;
++  Tensor ref_tensor() const         { return ref->value->value->get(); }
++  void release_resources() final;
++
++  explicit EntityTensorImpl(const Ref<intrusive_ptr<External>>& ref);
++  explicit EntityTensorImpl(const intrusive_ptr<External>& e);
++  explicit EntityTensorImpl(const Tensor& t);
++
++  static Tensors make(const std::string&  name,
++                      const RematFunc_t&  remat,
++                      const Tensors&      inputs);
++  // mutate_idx indicate which of the inputs will get mutated.
++  static void  mutate(const std::string&  name,
++                      const MutateFunc_t& mutate,
++                      const Tensors&      inputs,
++                      const std::vector<size_t>& mutate_idx);
++
++  intrusive_ptr<TensorImpl> shallow_copy_and_detach(const VariableVersion& version_counter,
++                                                    bool allow_tensor_metadata_change) const override;
++  void shallow_copy_from(const c10::intrusive_ptr<TensorImpl>& impl) override;
++
++  int64_t size(int64_t d) const               { return ref_tensor().size(d); }
++  int64_t stride(int64_t d) const             { return ref_tensor().stride(d); }
++
++  int64_t dim_custom() const override         { return ref_tensor().dim(); }
++  int64_t numel_custom() const override       { return ref_tensor().numel(); }
++  IntArrayRef sizes_custom() const override   { return ref_tensor().sizes(); }
++  IntArrayRef strides_custom() const override { return ref_tensor().strides(); }
++  
++  bool has_storage() const override           { return false; }
++
++  const Storage& storage() const override     { return ref_tensor().storage(); }
++  
++  template <typename T>
++  inline T* data_ptr_impl() const             { return ref_tensor().data_ptr(); }
++};
++
++inline EntityTensorImpl* get_entity_tensor_impl(const Tensor& t) {
++  auto* eti = dynamic_cast<EntityTensorImpl*>(t.unsafeGetTensorImpl());
++  TORCH_CHECK(eti != nullptr);
++  return eti;
++}
++
++inline Ref<intrusive_ptr<External>> get_cell_from_tensor(const Tensor& t) {
++  return get_entity_tensor_impl(t)->ref;
++}
++
++inline DispatchKeySet convert_key_set(const DispatchKeySet& t) {
++  TORCH_CHECK(!t.has(DispatchKey::Checkpoint));
++  auto ret = t.add(DispatchKey::Checkpoint);
++  return ret;
++}
++
++TORCH_API void setDebugCallbackFunction(std::function<int64_t()>);
++
++}
+\ No newline at end of file
+diff --git a/aten/src/ATen/cuda/detail/CUDAHooks.cpp b/aten/src/ATen/cuda/detail/CUDAHooks.cpp
+index 93a23ec6a73..9a147e350ac 100644
+--- a/aten/src/ATen/cuda/detail/CUDAHooks.cpp
++++ b/aten/src/ATen/cuda/detail/CUDAHooks.cpp
+@@ -17,6 +17,8 @@
+ #include <c10/cuda/CUDACachingAllocator.h>
+ #include <c10/util/irange.h>
+ 
++#include <ATen/cuda/CachingHostAllocator.h>
++
+ #if AT_CUDNN_ENABLED()
+ #include <ATen/cudnn/cudnn-wrapper.h>
+ #endif
+@@ -63,7 +65,8 @@ void CUDAHooks::initCUDA() const {
+   at::vitals::VitalsAPI.setVital("CUDA", "used", "true", /* force = */ true);
+ 
+   const auto num_devices = c10::cuda::device_count_ensure_non_zero();
+-  c10::cuda::CUDACachingAllocator::init(num_devices);
++  c10::cuda::CUDACachingAllocator::init(num_devices, at::cuda::getCachingHostAllocator());
++
+   at::cuda::detail::init_p2p_access_cache(num_devices);
+ 
+ #if AT_MAGMA_ENABLED()
+diff --git a/aten/src/ATen/native/native_functions.yaml b/aten/src/ATen/native/native_functions.yaml
+index 5d46a325bfb..d9af01864a5 100644
+--- a/aten/src/ATen/native/native_functions.yaml
++++ b/aten/src/ATen/native/native_functions.yaml
+@@ -5,6 +5,34 @@
+ # representing ScalarType's. They are now superseded by usage of
+ # `aten::to()`. The ops remain here for backward compatibility purposes.
+ 
++# ATM to entity 
++- func: checkpoint(Tensor self) -> Tensor
++  variants: method
++
++- func: uncheckpoint(Tensor self) -> Tensor
++  variants: method
++
++- func: decheckpoint(Tensor self) -> Tensor
++  variants: method
++
++- func: evict_checkpoint(Tensor self) -> bool
++  variants: method
++
++- func: remat_checkpoint(Tensor self) -> Tensor
++  variants: method
++
++- func: pageout_manual(Tensor self) -> bool
++  variants: method
++
++- func: pagein_manual(Tensor self) -> bool
++  variants: method
++
++- func: need_prefech(Tensor self) -> bool
++  variants: method
++
++- func: get_pointer(Tensor self) -> int
++  variants: method
++
+ # DEPRECATED. DO NOT USE
+ - func: _cast_Byte(Tensor self, bool non_blocking=False) -> Tensor
+   variants: function
+@@ -455,6 +483,7 @@
+     MkldnnCPU: mkldnn_add
+     ZeroTensor: add_zerotensor
+     NestedTensorCPU, NestedTensorCUDA: NestedTensor_add_Tensor
++    Checkpoint: checkpoint_add
+ 
+ - func: add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
+   device_check: NoCheck   # TensorIterator
+@@ -513,6 +542,7 @@
+   variants: function, method
+   dispatch:
+     CompositeExplicitAutograd: add
++    # Checkpoint: checkpoint_add
+ 
+ - func: add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)
+   device_check: NoCheck   # TensorIterator
+@@ -1125,6 +1155,7 @@
+   dispatch:
+     SparseCPU, SparseCUDA: cat_sparse
+     QuantizedCPU: cat_quantized_cpu
++    Checkpoint: checkpoint_cat
+ 
+ - func: cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)
+   structured: True
+@@ -1135,7 +1166,8 @@
+     CUDA: cat_out_cuda
+     MPS: cat_out_mps
+     QuantizedCPU: cat_out_quantized_cpu
+-
++    Checkpoint: checkpoint_cat_out
++    
+ - func: cat.names(Tensor[] tensors, Dimname dim) -> Tensor
+ 
+ - func: cat.names_out(Tensor[] tensors, Dimname dim, *, Tensor(a!) out) -> Tensor(a!)
+@@ -4068,7 +4100,8 @@
+   dispatch:
+     CompositeExplicitAutograd: select
+     SparseCsrCPU, SparseCsrCUDA: select_sparse_csr
+-
++    Checkpoint: checkpoint_select
++    
+ - func: select_backward(Tensor grad_output, int[] input_sizes, int dim, int index) -> Tensor
+   variants: function
+   device_check: NoCheck
+@@ -4297,6 +4330,7 @@
+   device_guard: False
+   dispatch:
+     CompositeExplicitAutograd: slice
++    Checkpoint: checkpoint_slice
+ 
+ - func: slice_backward(Tensor grad_output, int[] input_sizes, int dim, int start, int end, int step) -> Tensor
+   variants: function
+diff --git a/aten/src/ATen/templates/TensorBody.h b/aten/src/ATen/templates/TensorBody.h
+index 6d09d68deb1..7ab41f8368d 100644
+--- a/aten/src/ATen/templates/TensorBody.h
++++ b/aten/src/ATen/templates/TensorBody.h
+@@ -36,6 +36,7 @@
+ #include <ATen/core/TensorAccessor.h>
+ #include <ATen/core/TensorBase.h>
+ 
++// #include <c10/cuda/ATMConfig.h>
+ 
+ #include <ATen/MethodOperators.h>
+ 
+@@ -100,10 +101,18 @@ class TORCH_API Tensor: public TensorBase {
+   // detail invoked by autogenerated code.
+   explicit Tensor(
+       c10::intrusive_ptr<TensorImpl, UndefinedTensorImpl> tensor_impl)
+-      : TensorBase(std::move(tensor_impl)) {}
++      : TensorBase(std::move(tensor_impl)) {
++        // auto impl_profile_ = c10::cuda::get_impl_profile();
++        // impl_profile_->tensorLifeStart(unsafeGetTensorImpl());
++        // impl_profile_->tensorSetStorage(unsafeGetTensorImpl());
++      }
+   Tensor(const Tensor &tensor) = default;
+   Tensor(Tensor &&tensor) = default;
+ 
++  // ~Tensor() {
++  //   auto impl_profile_ = c10::cuda::get_impl_profile();
++  //   impl_profile_->tensorLifeEnds(unsafeGetTensorImpl());
++  // }
+   // Implicitly move-constructible from TensorBase, but must be explicit to increase refcount
+   explicit Tensor(const TensorBase &base): TensorBase(base) {}
+   /*implicit*/ Tensor(TensorBase &&base): TensorBase(std::move(base)) {}
+@@ -318,6 +327,17 @@ class TORCH_API Tensor: public TensorBase {
+   Tensor & index_put_(std::initializer_list<at::indexing::TensorIndex> indices, Tensor const & rhs);
+   Tensor & index_put_(std::initializer_list<at::indexing::TensorIndex> indices, const Scalar& v);
+ 
++
++  /// Returns a `Tensor`'s device.
++  c10::optional<Device> optional_device() const {
++    return impl_->optional_device();
++  }
++  
++  Tensor swapout() const {
++    // storage
++    return *this; 
++  }
++
+   Tensor cpu() const {
+     return to(options().device(DeviceType::CPU), /*non_blocking*/ false, /*copy*/ false);
+   }
+diff --git a/c10/core/ATMCommon.h b/c10/core/ATMCommon.h
+new file mode 100644
+index 00000000000..ebc00b9acdd
+--- /dev/null
++++ b/c10/core/ATMCommon.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++/// ensure data (no ensure)
++#define ATM_ENSURE_DATA
++
++/// debug log 
++// #define ATM_DEBUG_1
++
++/// access pattern log
++// #define ATM_DEBUG_2
++
++/// access pattern log (CUDACachingAllocator)
++// #define ATM_DEBUG_3
++
++/// access pattern log inside (ATMConfig)
++// #define ATM_DEBUG_4
++
++/// atm storage debug code
++#define ATM_DEBUG_STORAGE
+diff --git a/c10/core/EntityStorageImpl.h b/c10/core/EntityStorageImpl.h
+new file mode 100644
+index 00000000000..220bbb473f8
+--- /dev/null
++++ b/c10/core/EntityStorageImpl.h
+@@ -0,0 +1,118 @@
++#pragma once
++
++#include <c10/core/ATMCommon.h>
++#include <c10/core/Allocator.h>
++#include <c10/cuda/ATMConfig.h>
++
++#include <c10/util/intrusive_ptr.h>
++// #include <c10/core/StorageImpl.h>
++
++#include <mutex>
++#include <condition_variable>
++
++namespace c10 {
++
++struct StorageImpl;
++struct EntityStorageImpl;
++
++struct EntityStorageRef {
++  EntityStorageRef(EntityStorageImpl* impl) : 
++    impl_(impl) {}
++  EntityStorageRef(const EntityStorageRef &impl_ref) : 
++    impl_(impl_ref.impl_) {}
++  std::shared_ptr<EntityStorageImpl> impl_;
++};
++
++typedef EntityStorageRef* EntityStorageRef_t; 
++
++enum class EntityStorageStat : uint8_t {
++  kOnline,  // on  device
++  kOffline, // off device
++  kTrans,   // on  transfer
++};
++
++enum class TransStat : uint8_t {
++  kNone,    // no mission
++  kPgOut,   // on pageout
++  kPgIn     // on pagein
++};
++
++struct EntityStorageImpl {
++  // Abstract class. These methods must be defined for a specific implementation (e.g. CUDA)
++  virtual void do_pagein(void* dst, void* src, size_t size, bool sync) = 0;
++  virtual void do_pageout(void* dst, void* src, size_t size, bool sync) = 0;
++  virtual void do_pagein_cb() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    trans_stat_ = TransStat::kNone;
++    entity_stat_ = EntityStorageStat::kOnline;
++  }
++  virtual void do_pageout_cb() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    trans_stat_ = TransStat::kNone;
++    entity_stat_ = EntityStorageStat::kOffline;
++  }
++
++  EntityStorageImpl(StorageImpl* storage, c10::Allocator* host_allocator) :
++    storage_(storage), host_allocator_(host_allocator), dirty_(false),
++    trans_stat_(TransStat::kNone), entity_stat_(EntityStorageStat::kOnline) { 
++  }
++
++  EntityStorageImpl() = delete;
++  virtual ~EntityStorageImpl() {}
++  
++  void             release_resources();
++  virtual void     ensure_data() {
++    #ifdef ATM_DEBUG_STORAGE
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                      "EntityStorageImpl::ensure_data", "");
++    #endif
++    ensure_data_internal(true);
++  }
++
++  // StorageImpl accessors defined in StorageImpl.h to avoid circular depencencies
++  const Allocator* allocator() const;
++  size_t           capacity() const;
++  Device           device() const;
++  void*            device_ptr() const;
++  c10::DataPtr     set_device_ptr(c10::DataPtr&& data_ptr);
++  void             mark_dirty();
++  /*
++  * set synchronize true to use synchronize swapin
++  */
++  virtual void     ensure_data_internal(bool sync) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    std::lock_guard<std::mutex> ensure_lock(ensure_mutex_);
++  }
++  virtual void     prefetch_internal() = 0;
++  // Wait transfer done, you should do understand what you're doing !!!
++  virtual void     unsafe_wait_transfer() = 0;
++  
++  virtual void     pageout_internal() { do_pageout_cb(); }
++  virtual void     pagein_internal()  { do_pagein_cb(); }
++  virtual void     need_prefetch_internal() {}
++
++  virtual void     pageout_internal_sync() { }
++  virtual void     pagein_internal_sync()  { }
++
++  uint64_t         id() const { return entity_id_; }
++
++  // Initialized at or soon after construction
++  StorageImpl*    const storage_;
++  c10::Allocator* const host_allocator_;
++  uint64_t              entity_id_;
++  
++  mutable std::mutex    mutex_;
++  mutable std::mutex    ensure_mutex_;
++
++  // Guarded by mutex_
++  c10::DataPtr          host_data_ptr_;
++  bool                  dirty_;
++
++  TransStat             trans_stat_;
++  EntityStorageStat     entity_stat_;
++};
++
++
++namespace cuda {
++} // cuda
++} // c10
+\ No newline at end of file
+diff --git a/c10/core/StorageImpl.h b/c10/core/StorageImpl.h
+index cc167927229..afe3ba758db 100644
+--- a/c10/core/StorageImpl.h
++++ b/c10/core/StorageImpl.h
+@@ -5,6 +5,11 @@
+ 
+ #include <c10/util/intrusive_ptr.h>
+ 
++#include <c10/core/ATMCommon.h>
++#include <c10/core/EntityStorageImpl.h>
++
++#include <c10/cuda/ATMConfig.h>
++
+ namespace c10 {
+ 
+ // A storage represents the underlying backing data buffer for a
+@@ -44,7 +49,18 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+         size_bytes_(size_bytes),
+         resizable_(resizable),
+         received_cuda_(false),
+-        allocator_(allocator) {
++        allocator_(allocator),
++        entity_(allocator ? allocator->as_entity(this) : nullptr) {
++    #ifdef ATM_DEBUG_1
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::constructor", 
++                                    "Pre Allocated DataPtr Device: " + device().str());
++    #endif
++    #ifdef ATM_DEBUG_2
++    auto impl_profile_ = c10::cuda::get_impl_profile();
++    impl_profile_->storageLifeStart(this);
++    impl_profile_->storageSetStorage(this, data_ptr_.get(), nbytes());
++    #endif
+     if (resizable) {
+       TORCH_INTERNAL_ASSERT(
+           allocator_, "For resizable storage, allocator must be provided");
+@@ -61,14 +77,32 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+             size_bytes,
+             allocator->allocate(size_bytes),
+             allocator,
+-            resizable) {}
++            resizable) {
++    #ifdef ATM_DEBUG_1
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::constructor", 
++                                    "No Pre Allocated DataPtr Device: " + device().str());
++    #endif
++    #ifdef ATM_DEBUG_2
++    c10::cuda::get_impl_profile()->storageLifeStart(this);
++    #endif
++  }
+ 
+   StorageImpl& operator=(StorageImpl&& other) = default;
+   StorageImpl& operator=(const StorageImpl&) = delete;
+   StorageImpl() = delete;
+-  StorageImpl(StorageImpl&& other) = default;
++  StorageImpl(StorageImpl&& other) : entity_(other.entity_) {
++    #ifdef ATM_DEBUG_1
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::constructor", 
++                                    "No Pre Allocated (From Other) DataPtr Device: " + device().str());
++    #endif
++    // #ifdef ATM_DEBUG_2
++    // c10::cuda::get_impl_profile()->storageLifeStart(this);
++    // #endif
++  }
+   StorageImpl(const StorageImpl&) = delete;
+-  ~StorageImpl() override = default;
++  ~StorageImpl() override;
+ 
+   void reset() {
+     data_ptr_.clear();
+@@ -77,17 +111,31 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+ 
+   template <typename T>
+   inline T* data() const {
++    #ifdef ATM_ENSURE_DATA
++    if (atm_enabled()) entity_.impl_->ensure_data();
++    #endif
++    #ifdef ATM_DEBUG_1
++    T x_;
++    const char* type_name = typeid(x_).name();
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::data"+ std::string(type_name) +"(const)", 
++                                    "Accessed Data");
++    #endif
++    #ifdef ATM_DEBUG_2
++    c10::cuda::get_impl_profile()->storageAppendAccess(this);
++    #endif
+     return unsafe_data<T>();
+   }
+ 
+   template <typename T>
+   inline T* unsafe_data() const {
++    #ifdef ATM_ENSURE_DATA
++    if (atm_enabled()) entity_.impl_->ensure_data();
++    #endif
+     return static_cast<T*>(this->data_ptr_.get());
+   }
+ 
+-  void release_resources() override {
+-    data_ptr_.clear();
+-  }
++  void release_resources() override;
+ 
+   size_t nbytes() const {
+     return size_bytes_;
+@@ -103,10 +151,16 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+   };
+ 
+   at::DataPtr& data_ptr() {
++    #ifdef ATM_ENSURE_DATA
++    if (atm_enabled()) entity_.impl_->ensure_data();
++    #endif
+     return data_ptr_;
+   };
+ 
+   const at::DataPtr& data_ptr() const {
++    #ifdef ATM_ENSURE_DATA
++    if (atm_enabled()) entity_.impl_->ensure_data();
++    #endif
+     return data_ptr_;
+   };
+ 
+@@ -114,6 +168,15 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+   at::DataPtr set_data_ptr(at::DataPtr&& data_ptr) {
+     at::DataPtr old_data_ptr(std::move(data_ptr_));
+     data_ptr_ = std::move(data_ptr);
++    #ifdef ATM_DEBUG_1
++    // printf("Set DataPtr Device: %s\n", device().str().c_str());
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::set_data_ptr", 
++                                    "Set DataPtr Device: " + device().str());
++    #endif
++    #ifdef ATM_DEBUG_2
++    c10::cuda::get_impl_profile()->storageSetStorage(this, data_ptr_.get(), nbytes());
++    #endif
+     return old_data_ptr;
+   };
+ 
+@@ -123,10 +186,32 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+ 
+   // TODO: Return const ptr eventually if possible
+   void* data() {
++    #ifdef ATM_ENSURE_DATA
++    if (atm_enabled()) entity_.impl_->ensure_data();
++    #endif
++    #ifdef ATM_DEBUG_1
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::data",
++                                    "Accessed Data");
++    #endif
++    #ifdef ATM_DEBUG_2
++    c10::cuda::get_impl_profile()->storageAppendAccess(this);
++    #endif
+     return data_ptr_.get();
+   }
+ 
+   void* data() const {
++    #ifdef ATM_ENSURE_DATA
++    if (atm_enabled()) entity_.impl_->ensure_data();
++    #endif
++    #ifdef ATM_DEBUG_1
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::data_ptr(const)",
++                                    "Accessed Data");
++    #endif
++    #ifdef ATM_DEBUG_2
++    c10::cuda::get_impl_profile()->storageAppendAccess(this);
++    #endif
+     return data_ptr_.get();
+   }
+ 
+@@ -135,10 +220,21 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+   }
+ 
+   at::Allocator* allocator() {
++    #ifdef ATM_DEBUG_1
++    // printf("Used Allocator Once\n");
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::allocator", 
++                                    "Used Allocator Once");
++    #endif
+     return allocator_;
+   }
+ 
+   const at::Allocator* allocator() const {
++    #ifdef ATM_DEBUG_1
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "StorageImpl::allocator(const)", 
++                                    "Used Allocator Once");
++    #endif
+     return allocator_;
+   };
+ 
+@@ -195,13 +291,45 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
+     return received_cuda_;
+   }
+ 
+- private:
++  // manual method should be deprecated other than debug   
++  void pageout_manual();
++  void pagein_manual();
++  void need_prefetch();
++  
++  bool atm_enabled() const { return entity_.impl_.get() != nullptr; }
++ 
++  EntityStorageRef& entity() {
++    return entity_;
++  }
++
+   DataPtr data_ptr_;
++ private:
+   size_t size_bytes_;
+   bool resizable_;
+   // Identifies that Storage was received from another process and doesn't have
+   // local to process cuda memory allocation
+   bool received_cuda_;
++
+   Allocator* allocator_;
++
++  EntityStorageRef entity_;
+ };
++
++inline const c10::Allocator* EntityStorageImpl::allocator() const {
++  return storage_->allocator();
++}
++inline size_t EntityStorageImpl::capacity() const {
++  return storage_->nbytes();
++}
++inline void* EntityStorageImpl::device_ptr() const {
++  return storage_->data_ptr_.get();
++}
++inline c10::Device EntityStorageImpl::device() const {
++  return storage_->device();
++}
++inline c10::DataPtr EntityStorageImpl::set_device_ptr(c10::DataPtr&& data_ptr) {
++  std::swap(storage_->data_ptr_, data_ptr);
++  return std::move(data_ptr);
++}
++
+ } // namespace c10
+diff --git a/c10/core/TensorImpl.cpp b/c10/core/TensorImpl.cpp
+index a8d72a4bfe5..2a467173529 100644
+--- a/c10/core/TensorImpl.cpp
++++ b/c10/core/TensorImpl.cpp
+@@ -8,6 +8,8 @@
+ #include <c10/util/Optional.h>
+ #include <c10/util/irange.h>
+ 
++#include <c10/cuda/ATMConfig.h>
++
+ C10_DEFINE_bool(
+     caffe2_keep_on_shrink,
+     true,
+@@ -69,7 +71,10 @@ void TensorImpl::_set_fw_grad(
+ }
+ 
+ // some compiler does not generate the destructor correctly
+-TensorImpl::~TensorImpl() = default;
++TensorImpl::~TensorImpl() = default; 
++// {
++  // if (storage_.unsafeGetStorageImpl() != nullptr && storage_.unsafeGetStorageImpl()->atm_enabled()) printf("TensorImpl::FreeMemory(%ld)\n", storage_.unsafeGetStorageImpl()->entity().impl_->entity_id_);
++// }
+ 
+ TensorImpl::TensorImpl(
+     Storage&& storage,
+@@ -118,6 +123,8 @@ TensorImpl::TensorImpl(
+   if (!is_inference()) {
+     version_counter_ = VariableVersion(/*version=*/0);
+   }
++  // auto impl_profile_ = c10::cuda::get_impl_profile();
++  // impl_profile_->tensorLifeStart(this);
+ }
+ 
+ TensorImpl::TensorImpl(
+@@ -180,6 +187,9 @@ TensorImpl::TensorImpl(
+ 
+   // we would also like to check that non-cpu devices have an index, but some
+   // Caffe2 operators create Storages with default devices.
++
++  // auto impl_profile_ = c10::cuda::get_impl_profile();
++  // impl_profile_->tensorLifeStart(this);
+ }
+ 
+ void TensorImpl::HandleResize() {
+@@ -322,6 +332,7 @@ bool TensorImpl::compute_non_overlapping_and_dense() const {
+ void TensorImpl::release_resources() {
+   autograd_meta_.reset();
+   if (storage_) {
++    // if (storage_.unsafeGetStorageImpl() != nullptr && storage_.unsafeGetStorageImpl()->atm_enabled()) printf("TensorImpl::release_resources(%ld)\n", storage_.unsafeGetStorageImpl()->entity().impl_->entity_id_);
+     storage_ = {};
+   }
+   if (owns_pyobj()) {
+@@ -775,5 +786,42 @@ AutogradMetaFactory* GetAutogradMetaFactory() {
+ }
+ 
+ } // namespace impl
++namespace cuda {
++
++void ImplProfile::tensorLifeStart(const c10::TensorImpl* tensor_ptr) {
++  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++  // const void *data_ptr = tensor_ptr->data();
++  tensor_profile_.insert(
++    std::make_pair(reinterpret_cast<uint64_t>(tensor_ptr), 
++    ImplProfileEl{
++      0,
++      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
++      0,
++      0,
++      {}
++    })
++  );
++  return;
++}
++void ImplProfile::tensorLifeEnds(const c10::TensorImpl* tensor_ptr) {
++  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++  tensor_profile_[reinterpret_cast<uint64_t>(tensor_ptr)].life_end_ = 
++    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++  return;
++}
++void ImplProfile::tensorSetStorage(const c10::TensorImpl* tensor_ptr) {
++  std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++  tensor_profile_[reinterpret_cast<uint64_t>(tensor_ptr)].data_ptr_ = reinterpret_cast<uint64_t>(tensor_ptr->data());
++  tensor_profile_[reinterpret_cast<uint64_t>(tensor_ptr)].size_ = tensor_ptr->storage().nbytes();
++  return;
++}
++
++static ATMDebugLog debug_logger;  
++ATMDebugLog* get_debug_log() { return &debug_logger; }
++
++static ImplProfile impl_profile;
++ImplProfile* get_impl_profile() { return &impl_profile; }
++
++} // namespace cuda
+ 
+ } // namespace c10
+diff --git a/c10/core/TensorImpl.h b/c10/core/TensorImpl.h
+index 90f73e03511..a364c2edfc8 100644
+--- a/c10/core/TensorImpl.h
++++ b/c10/core/TensorImpl.h
+@@ -518,7 +518,28 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
+   TensorImpl& operator=(const TensorImpl&) = delete;
+   TensorImpl(TensorImpl&&) = delete;
+   TensorImpl& operator=(TensorImpl&&) = delete;
++  
++  /**
++   *  
++   */
++  bool allow_remateriazation() const {
++    return allow_remateriazation_;
++  }
++
++  /**
++   *  
++   */
++  void enable_remateriazation() {
++    allow_remateriazation_ = true;
++  }
+ 
++  /**
++   *  
++   */
++  void disable_remateriazation() {
++    allow_remateriazation_ = false;
++  }
++  
+   /**
+    * Release (decref) storage, and any other external allocations.  This
+    * override is for `intrusive_ptr_target` and is used to implement weak
+@@ -904,6 +925,10 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
+     return *device_opt_;
+   }
+ 
++  c10::optional<c10::Device> optional_device() const {
++    return device_opt_;
++  }
++
+   Layout layout() const {
+     // NB: This method is not virtual and avoid dispatches for perf.
+     // strided is also the most common layout type, so we check for
+@@ -1492,6 +1517,9 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
+    * compatible with SparseCUDA.
+    */
+   inline bool has_compatible_shallow_copy_type(DispatchKeySet from) {
++    if (key_set_.has(DispatchKey::Checkpoint) || from.has(DispatchKey::Checkpoint)) 
++      return key_set_ == from;
++    
+     auto is_dense = [](DispatchKeySet ts) {
+       constexpr auto dense_backends = DispatchKeySet(
+           {BackendComponent::CPUBit,
+@@ -2424,6 +2452,9 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
+   // key_set_.has(DispatchKey::Named)
+   DispatchKeySet key_set_;
+ 
++  // Identifies that content of Tensor was get by operator (can be enableriazation) 
++  bool allow_remateriazation_;
++
+  private:
+   // C10_TensorImpl_Size_Check_Dummy_Class needs to be friends with
+   // TensorImpl so it can inspect the size of private fields
+diff --git a/c10/cuda/ATMConfig.cpp b/c10/cuda/ATMConfig.cpp
+new file mode 100644
+index 00000000000..416f6fbe82a
+--- /dev/null
++++ b/c10/cuda/ATMConfig.cpp
+@@ -0,0 +1,11 @@
++#include <c10/cuda/ATMConfig.h>
++
++namespace c10 { namespace cuda {
++
++// ATMDebugLog debug_logger;  
++// ATMDebugLog* get_debug_log() { return &debug_logger; }
++
++// ImplProfile impl_profile;
++// ImplProfile* get_impl_profile() { return &impl_profile; }
++
++} }
+\ No newline at end of file
+diff --git a/c10/cuda/ATMConfig.h b/c10/cuda/ATMConfig.h
+new file mode 100644
+index 00000000000..8639d8a8bb6
+--- /dev/null
++++ b/c10/cuda/ATMConfig.h
+@@ -0,0 +1,228 @@
++#pragma once
++// #include <c10/macros/Macros.h>
++#include <c10/core/Allocator.h>
++#include <c10/core/ATMCommon.h>
++// #include <c10/core/TensorImpl.h>
++// #include <c10/core/StorageImpl.h>
++#include <c10/cuda/CUDAMacros.h>
++#include <c10/util/IntrusiveList.h>
++
++#include <mutex>
++#include <exception>
++#include <map>
++#include <vector>
++#include <string>
++#include <iterator>
++#include <cstdint>
++#include <chrono>
++#include <cstdio>
++#include <typeinfo>
++
++// 2^15
++#define MAX_LOG_PRESERVED 32768
++namespace c10 {
++
++struct TensorImpl;
++struct StorageImpl;
++
++namespace cuda {
++// List of [ Calling Function + Debug Log ] 
++typedef std::vector<std::pair<std::string, std::string>> DebugLogList;
++
++class ATMDebugLog;
++class ImplProfile;
++
++C10_CUDA_API ATMDebugLog* get_debug_log();
++C10_CUDA_API ImplProfile* get_impl_profile();
++
++class ATMConfig {
++  public: 
++  ATMConfig() = default;
++};
++
++enum class ATMLogLevel {
++  DEBUG,
++  INFO,
++  WARNING,
++  ERROR
++};
++
++class ATMDebugLog {
++  public:
++  ATMDebugLog() = default;
++  void add_debug(const ATMLogLevel level, const std::string &func, const std::string &info) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    switch (level) {
++      case ATMLogLevel::DEBUG : { 
++        count_debug_log_++; 
++        debug_log_.push_back(std::make_pair(func, info)); 
++        if (count_debug_log_ % MAX_LOG_PRESERVED == 0) handle_log_oom("debug", debug_log_, count_debug_log_);
++        break; }
++      case ATMLogLevel::INFO : { 
++        count_info_log_++; 
++        info_log_.push_back(std::make_pair(func, info)); 
++        if (count_info_log_ % MAX_LOG_PRESERVED == 0) handle_log_oom("info", info_log_, count_info_log_);
++        break; }
++      case ATMLogLevel::WARNING : { 
++        count_warning_log_++; 
++        warning_log_.push_back(std::make_pair(func, info)); 
++        if (count_warning_log_ % MAX_LOG_PRESERVED == 0) handle_log_oom("warning", warning_log_, count_warning_log_);
++        break; }
++      case ATMLogLevel::ERROR : { 
++        count_error_log_++; 
++        error_log_.push_back(std::make_pair(func, info)); 
++        if (count_error_log_ % MAX_LOG_PRESERVED == 0) handle_log_oom("error", error_log_, count_error_log_);
++        break; }
++    }
++    
++  }
++  const DebugLogList& get_debug(ATMLogLevel level) const {
++    switch (level) {
++      case ATMLogLevel::DEBUG : return debug_log_;
++      case ATMLogLevel::INFO  : return info_log_;
++      case ATMLogLevel::WARNING : return warning_log_;
++      case ATMLogLevel::ERROR : return error_log_;
++    }
++    return debug_log_;
++  }
++  void clear_debug(ATMLogLevel level) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    switch (level) {
++      case ATMLogLevel::DEBUG : debug_log_.clear();
++                                break;
++      case ATMLogLevel::INFO  : info_log_.clear();
++                                break;
++      case ATMLogLevel::WARNING : warning_log_.clear();
++                                break;
++      case ATMLogLevel::ERROR : error_log_.clear();
++                                break;
++    }
++  }
++  private:
++  void handle_log_oom(std::string log_name, DebugLogList& log_list, int log_count) {
++    if (log_count % MAX_LOG_PRESERVED) return; 
++    log_count -= MAX_LOG_PRESERVED;
++    int iter = 0;
++    FILE* fd = fopen((log_name + ".atm.log").c_str(), "a+");
++    for (auto log_el : log_list) {
++      std::string debug_output = "[" + std::to_string((++iter) + log_count) + "]" + log_el.first + "|=>|" + log_el.second + "\n";
++      fprintf(fd, "%s", debug_output.c_str());
++    }
++    log_list.clear();
++  }
++
++  std::mutex mutex_;
++  // Guarded by mutex_
++  DebugLogList debug_log_; 
++  DebugLogList info_log_;
++  DebugLogList warning_log_;
++  DebugLogList error_log_;
++  int count_debug_log_;
++  int count_info_log_;
++  int count_warning_log_;
++  int count_error_log_;
++};
++
++struct ImplProfileEl {
++  uint64_t data_ptr_;
++  int64_t life_start_;
++  int64_t life_end_;
++  uint64_t size_; // in Byte
++  std::vector<int64_t> access_seq_;
++  uint8_t by_operator;
++};
++class ImplProfile {
++  public:
++  ImplProfile() = default;
++  void tensorLifeStart(const c10::TensorImpl* tensor_ptr);
++  //   const void *data_ptr = tensor_ptr->data();
++  //   tensor_profile_.insert(
++  //     std::make_pair(reinterpret_cast<uint64_t>(tensor_ptr), 
++  //     ImplProfileEl{
++  //       reinterpret_cast<uint64_t>(data_ptr),
++  //       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
++  //       0,
++  //       tensor_ptr->storage().nbytes()
++  //     })
++  //   );
++  //   return;
++  // }
++  void tensorSetStorage(const c10::TensorImpl* tensor_ptr);
++  void tensorLifeEnds(const c10::TensorImpl* tensor_ptr);
++  //   tensor_profile_[reinterpret_cast<uint64_t>(tensor_ptr)].life_end_ = 
++  //     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++  //   return;
++  // }
++  void storageLifeStart(const c10::StorageImpl* storage_ptr) {
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    // const void *data_ptr = tensor_ptr->data();
++    storage_profile_.insert(std::make_pair(reinterpret_cast<uint64_t>(storage_ptr), 
++      ImplProfileEl{
++        0,
++        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
++        0, 0, {}, 0
++      })
++    );
++    return;
++  }
++  void storageLifeEnds(const c10::StorageImpl* storage_ptr) {
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    if (storage_profile_.find(reinterpret_cast<uint64_t>(storage_ptr)) == storage_profile_.end()) {
++      storage_profile_.insert(std::make_pair(reinterpret_cast<uint64_t>(storage_ptr),
++        ImplProfileEl{ 0, 0, 0, 0, {}, 0}) );
++      #ifdef ATM_DEBUG_4
++      get_debug_log()->add_debug(ATMLogLevel::DEBUG, 
++                                "ImplProfile::storageLifeEnds", 
++                                std::to_string(reinterpret_cast<uint64_t>(storage_ptr)) + "Not Found");
++      #endif
++      // return;
++    }
++    storage_profile_[reinterpret_cast<uint64_t>(storage_ptr)].life_end_ = 
++      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++  }
++  void storageSetStorage(const c10::StorageImpl* storage_ptr, void* data_ptr, size_t size) {
++    if (storage_profile_.find(reinterpret_cast<uint64_t>(storage_ptr)) == storage_profile_.end()) {
++      #ifdef ATM_DEBUG_4
++      get_debug_log()->add_debug(ATMLogLevel::DEBUG, 
++                                "ImplProfile::storageSetStorage", 
++                                std::to_string(reinterpret_cast<uint64_t>(storage_ptr)) + "Not Found");
++      #endif
++      return;
++    }
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    storage_profile_[reinterpret_cast<uint64_t>(storage_ptr)].data_ptr_ = reinterpret_cast<uint64_t>(data_ptr);
++    storage_profile_[reinterpret_cast<uint64_t>(storage_ptr)].size_ = size;
++  }
++
++  void storageAppendAccess(const c10::StorageImpl* storage_ptr) {
++    if (storage_profile_.find(reinterpret_cast<uint64_t>(storage_ptr)) == storage_profile_.end()) {
++      storage_profile_.insert(std::make_pair(reinterpret_cast<uint64_t>(storage_ptr),
++        ImplProfileEl{ 0, 0, 0, 0, {}, 0}) );
++      #ifdef ATM_DEBUG_4
++      get_debug_log()->add_debug(ATMLogLevel::DEBUG, 
++                                "ImplProfile::storageAppendAccess", 
++                                std::to_string(reinterpret_cast<uint64_t>(storage_ptr)) + "Not Found");
++      #endif
++      // return;
++    }
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    storage_profile_[reinterpret_cast<uint64_t>(storage_ptr)].access_seq_.push_back(
++      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
++    );
++  }
++  
++  void clear_storage_profile() { storage_profile_.clear(); }
++  std::map<uint64_t, ImplProfileEl>& get_storage_profile() { return storage_profile_; }
++  private:
++
++  std::mutex mutex_;
++  // Guarded by mutex_
++  std::map<uint64_t, ImplProfileEl> tensor_profile_;
++  std::map<uint64_t, ImplProfileEl> storage_profile_;
++  
++};
++
++
++
++} // cuda
++} // c10
+diff --git a/c10/cuda/CMakeLists.txt b/c10/cuda/CMakeLists.txt
+index a95bd278e20..6dc6fac29aa 100644
+--- a/c10/cuda/CMakeLists.txt
++++ b/c10/cuda/CMakeLists.txt
+@@ -20,14 +20,17 @@ configure_file(
+ # torch/utils/hipify/cuda_to_hip_mappings.py for new files
+ # and headers you add
+ set(C10_CUDA_SRCS
++    ATMConfig.cpp
+     CUDAStream.cpp
+     CUDAFunctions.cpp
+     CUDAMiscFunctions.cpp
+     CUDACachingAllocator.cpp
++    CUDASwapQueues.cpp
+     impl/CUDAGuardImpl.cpp
+     impl/CUDATest.cpp
+ )
+ set(C10_CUDA_HEADERS
++    ATMConfig.h
+     CUDAException.h
+     CUDAGuard.h
+     CUDAMacros.h
+@@ -35,6 +38,7 @@ set(C10_CUDA_HEADERS
+     CUDAStream.h
+     CUDAFunctions.h
+     CUDAMiscFunctions.h
++    CUDASwapQueues.h
+     impl/CUDAGuardImpl.h
+     impl/CUDATest.h
+ )
+diff --git a/c10/cuda/CUDACachingAllocator.cpp b/c10/cuda/CUDACachingAllocator.cpp
+index a098003f950..cf34b833678 100644
+--- a/c10/cuda/CUDACachingAllocator.cpp
++++ b/c10/cuda/CUDACachingAllocator.cpp
+@@ -9,6 +9,11 @@
+ #include <c10/util/irange.h>
+ #include <c10/util/llvmMathExtras.h>
+ 
++#include <c10/cuda/ATMConfig.h>
++#include <c10/cuda/CUDASwapQueues.h>
++#include <c10/core/ATMCommon.h>
++#include <c10/core/StorageImpl.h>
++
+ #include <cuda_runtime_api.h>
+ #include <algorithm>
+ #include <bitset>
+@@ -330,6 +335,162 @@ cudaError_t cudaMallocMaybeCapturing(void** p, size_t size) {
+ 
+ } // namespace
+ 
++#define CUDA_INVALID_STREAM ((cudaStream_t)-1)
++
++struct EntityContext {
++  EntityContext() :
++        limit_(0), host_allocator_(nullptr), 
++        stream_in_(CUDA_INVALID_STREAM), stream_out_(CUDA_INVALID_STREAM) {}
++
++  size_t          limit() { return limit_; }
++  void            set_limit(size_t limit) { limit_ = limit; }
++
++  c10::Allocator* host_allocator() { return host_allocator_; }
++  void            set_host_allocator(c10::Allocator* host_allocator) { host_allocator_ = host_allocator; }
++  
++  cudaStream_t    stream_in() { return stream_in_; } 
++  cudaStream_t    stream_out() { return stream_out_; }
++  void            set_streams(cudaStream_t out, cudaStream_t in) {
++    if (stream_out_ == CUDA_INVALID_STREAM) {
++      TORCH_INTERNAL_ASSERT(out != CUDA_INVALID_STREAM);
++      stream_out_ = out; stream_in_  = in;
++    }
++  }
++
++  size_t          device_limit(int64_t current, int device) {
++    size_t device_limit = limit_;
++    if (device_limit == 0) {
++      size_t available;
++      size_t capacity;
++      C10_CUDA_CHECK(cudaMemGetInfo(&available, &capacity));
++      // Reserve five percent of available memory for non-tensor uses
++      device_limit = static_cast<size_t>((available + current) * 0.95);
++    }
++    return device_limit;
++  }
++
++  size_t             limit_;
++  at::Allocator*     host_allocator_;
++  cudaStream_t       stream_in_;
++  cudaStream_t       stream_out_;
++};
++static EntityContext entity_context;
++
++// cuda-entity guarded by mutex
++static uint64_t get_cuda_entity_uid() { 
++  static std::mutex uid_count_mutex;
++  static uint64_t   cuda_entity_uid_count = 0;
++  std::lock_guard<std::mutex> lock(uid_count_mutex); 
++  return cuda_entity_uid_count++;
++}
++
++void CUDART_CB __do_pageout_cb(cudaStream_t stream, cudaError_t status, void *data);
++void CUDART_CB __do_pagein_cb(cudaStream_t stream, cudaError_t status, void *data);
++
++struct CudaEntityStorageImpl : public c10::EntityStorageImpl {
++  CudaEntityStorageImpl(c10::StorageImpl* storage) :
++    c10::EntityStorageImpl(storage, entity_context.host_allocator()),
++    block_(nullptr), 
++    pageout_stream_(CUDA_INVALID_STREAM), 
++    pagein_stream_ (CUDA_INVALID_STREAM),
++    on_prefetch_(false),
++    need_prefetch_(false) {
++    entity_id_ = get_cuda_entity_uid();
++  }
++  ~CudaEntityStorageImpl() { }
++
++  void            set_block(Block* block) { block_ = block; }
++  Block*          block() const { return block_; }
++
++  void            assign_streams(cudaStream_t out, cudaStream_t in) {
++    if (pageout_stream_ == CUDA_INVALID_STREAM) {
++      TORCH_INTERNAL_ASSERT(out != CUDA_INVALID_STREAM);
++      pageout_stream_ = out;
++      pagein_stream_  = in;
++      compute_stream_ = block_->stream;
++    }
++  }
++  
++  void            do_pageout_cb() override {
++    std::unique_lock<std::mutex> lock(mutex_);
++    lock.unlock();
++    pgoutcb_cv_.notify_all();
++  }
++  void            do_pagein_cb() override {
++    std::unique_lock<std::mutex> lock(mutex_);
++    lock.unlock(); 
++    pgincb_cv_.notify_all();
++  }
++
++  void            do_pageout(void* dst, void* src, size_t size, bool sync) override;
++  void            do_pagein(void* dst, void* src, size_t size, bool sync) override;
++
++  cudaStream_t    swap(void* dst, const void* src, size_t size, enum cudaMemcpyKind kind, cudaStream_t stream) {
++    TORCH_INTERNAL_ASSERT(stream != CUDA_INVALID_STREAM);
++    cudaEvent_t event = create_event();
++    // Synchronize swap stream with compute stream
++    if(kind == cudaMemcpyDeviceToHost) {
++      C10_CUDA_CHECK(cudaEventRecord(event, compute_stream_));
++      C10_CUDA_CHECK(cudaStreamWaitEvent(stream, event, 0));
++    }
++    // Queue copy
++    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
++    // Record event to wait on copy completion
++    C10_CUDA_CHECK(cudaEventRecord(event, stream));
++    event_ = event;
++    return stream;
++  }
++  void            pageout_internal() override {
++    CudaEntityEvictQueue::get_evict_queue().enqueue(this);
++  }
++  // enqueue prefetch queue, do fetch later
++  void            pagein_internal() override {
++    CudaEntityFetchQueue::get_fetch_queue().enqueue(this);
++  }
++
++  void            pageout_internal_sync() override;
++  void            pagein_internal_sync() override;
++
++  void            ensure_data() override {
++    ensure_data_internal(true /* reserved */);
++  }
++  // synchronize (true/false) ensure data
++  void            ensure_data_internal(bool sync) override;
++  // enqueue prefetch queue, do prefetch later
++  void            need_prefetch_internal() override { 
++    CudaEntityFetchQueue::get_fetch_queue().enqueue(this);
++  }
++  void            prefetch_internal() override { }
++  void            unsafe_wait_transfer() override { }
++
++  cudaEvent_t     create_event();
++
++  Block*                  block_; // cache block pointer for use while on reclaim list
++  cudaStream_t            compute_stream_;
++  cudaStream_t            pageout_stream_;
++  cudaStream_t            pagein_stream_;
++  cudaEvent_t             event_;
++
++  std::condition_variable pgincb_cv_;
++  std::condition_variable pgoutcb_cv_;
++  // guarded by mutex
++  bool                    on_prefetch_;
++  bool                    need_prefetch_;
++};
++
++void CUDART_CB __do_pageout_cb(cudaStream_t stream, cudaError_t status, void *data) {
++  C10_CUDA_CHECK(status);
++  EntityStorageRef_t impl = reinterpret_cast<EntityStorageRef_t>(data);
++  impl->impl_->do_pageout_cb();
++  delete impl; // must delete here, or entity leaks
++}
++void CUDART_CB __do_pagein_cb(cudaStream_t stream, cudaError_t status, void *data) {
++  C10_CUDA_CHECK(status);
++  EntityStorageRef_t impl = reinterpret_cast<EntityStorageRef_t>(data);
++  impl->impl_->do_pagein_cb();
++  delete impl;  // must delete here, or entity leaks   
++}
++
+ class CachingAllocatorConfig {
+  public:
+   static size_t max_split_size() {
+@@ -488,6 +649,11 @@ class DeviceCachingAllocator {
+     stats.max_split_size = CachingAllocatorConfig::max_split_size();
+   }
+ 
++  cudaEvent_t create_event() {
++    std::lock_guard<std::recursive_mutex> lock(mutex);
++    return create_event_internal();
++  }
++
+   // All public methods (except the above) acquire the allocator mutex.
+   // Thus, do not call a public method from another public method.
+ 
+@@ -669,7 +835,6 @@ class DeviceCachingAllocator {
+ 
+   void free(Block* block) {
+     std::lock_guard<std::recursive_mutex> lock(mutex);
+-
+     block->allocated = false;
+ 
+     // following logic might modifying underlaying Block, causing the size
+@@ -687,7 +852,6 @@ class DeviceCachingAllocator {
+     });
+     if (block->size >= CachingAllocatorConfig::max_split_size())
+       update_stat(stats.oversize_allocations, -1);
+-
+     if (!block->stream_uses.empty()) {
+       if (C10_UNLIKELY(captures_underway)) {
+         // It's forbidden to cudaEventQuery an event recorded during CUDA graph
+@@ -701,7 +865,6 @@ class DeviceCachingAllocator {
+     } else {
+       free_block(block);
+     }
+-
+     c10::reportMemoryUsageToProfiler(
+         orig_block_ptr,
+         -orig_block_size,
+@@ -863,7 +1026,6 @@ class DeviceCachingAllocator {
+         [](const SegmentInfo& a, const SegmentInfo& b) {
+           return a.address < b.address;
+         });
+-
+     return result;
+   }
+ 
+@@ -1317,7 +1479,6 @@ class DeviceCachingAllocator {
+     }
+     return true;
+   }
+-
+   bool release_cached_blocks() {
+     // First ensure that all blocks that can't currently be allocated due to
+     // outstanding events are returned to the pool.
+@@ -1326,7 +1487,6 @@ class DeviceCachingAllocator {
+     // Free all non-split cached blocks to system allocator
+     release_blocks(large_blocks);
+     release_blocks(small_blocks);
+-
+     for (auto it = graph_pools_freeable.begin();
+          it != graph_pools_freeable.end();) {
+       // See notifyCaptureDestroy for the strategy here.
+@@ -1348,7 +1508,7 @@ class DeviceCachingAllocator {
+   void release_block(Block* block) {
+     C10_CUDA_CHECK(cudaFree((void*)block->ptr));
+     total_allocated_memory -= block->size;
+-
++    
+     auto* pool = block->pool;
+     if (pool->owner_PrivatePool) {
+       // The cudaFreed block belonged to a CUDA graph's PrivatePool.
+@@ -1534,7 +1694,7 @@ class THCCachingAllocator {
+     return block;
+   }
+ 
+-  void init(int device_count) {
++  void init(int device_count, c10::Allocator* host_allocator) {
+     const auto size = static_cast<int64_t>(device_allocator.size());
+     if (size < device_count) {
+       device_allocator.resize(device_count);
+@@ -1542,6 +1702,8 @@ class THCCachingAllocator {
+         device_allocator[i] = std::make_unique<DeviceCachingAllocator>();
+       }
+     }
++    entity_context.set_host_allocator(host_allocator);
++    entity_context.set_streams(cuda::getCustomCUDAStream().stream(), cuda::getCustomCUDAStream().stream());
+   }
+ 
+   /** allocates a block which is safe to use from the provided stream */
+@@ -1557,6 +1719,11 @@ class THCCachingAllocator {
+   }
+ 
+   void free(void* ptr) {
++    #ifdef ATM_DEBUG_STORAGE 
++    // c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++    //                                 "THCCachingAllocator::free", 
++    //                                 "CUDA-Ptr:" + std::to_string(reinterpret_cast<uint64_t>(ptr)));
++    #endif
+     if (!ptr) {
+       return;
+     }
+@@ -1633,6 +1800,118 @@ class THCCachingAllocator {
+ 
+ THCCachingAllocator caching_allocator;
+ 
++void CudaEntityStorageImpl::pageout_internal_sync() { 
++  std::lock_guard<std::mutex> lock(mutex_);
++  TORCH_INTERNAL_ASSERT(entity_stat_ == EntityStorageStat::kOnline);
++  TORCH_INTERNAL_ASSERT(trans_stat_ == TransStat::kNone);
++  set_block(caching_allocator.get_allocated_block(device_ptr()));
++  if (block_ == nullptr) return;
++  assign_streams(entity_context.stream_out(), entity_context.stream_in());
++  size_t size = capacity();
++  void* dst = host_data_ptr_.get();
++  if (!dst) {
++    host_data_ptr_ = host_allocator_->allocate(size);
++    dst = host_data_ptr_.get();
++  }
++  entity_stat_ = EntityStorageStat::kTrans;
++  trans_stat_ = TransStat::kPgOut;
++  do_pageout(dst, device_ptr(), size, true);
++  auto old_device_ptr = set_device_ptr(at::DataPtr(nullptr, device()));
++  old_device_ptr.clear(); // Fxxk LMS :-(
++  entity_stat_ = EntityStorageStat::kOffline; 
++  trans_stat_ = TransStat::kNone; 
++}
++
++void CudaEntityStorageImpl::pagein_internal_sync() { 
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (entity_stat_ == EntityStorageStat::kOnline && trans_stat_ == TransStat::kNone 
++    || entity_stat_ == EntityStorageStat::kTrans && trans_stat_ == TransStat::kPgIn) 
++    return;
++  TORCH_INTERNAL_ASSERT(entity_stat_ == EntityStorageStat::kOffline);
++  TORCH_INTERNAL_ASSERT(trans_stat_ == TransStat::kNone);
++  size_t size = capacity();
++  trans_stat_ = TransStat::kPgIn;
++  entity_stat_ = EntityStorageStat::kTrans;
++  
++  auto dst = allocator()->allocate(size);
++  do_pagein(dst.get(), host_data_ptr_.get(), size, true);
++  // must do move after do_pagein
++  set_device_ptr(std::move(dst));
++  trans_stat_ = TransStat::kNone;
++  entity_stat_ = EntityStorageStat::kOnline;
++}
++
++void CudaEntityStorageImpl::ensure_data_internal(bool __reserved__) {
++  std::lock_guard<std::mutex> ensure_lock(ensure_mutex_);
++  std::unique_lock<std::mutex> lock(mutex_);
++  switch (entity_stat_) {
++    case EntityStorageStat::kOnline   : return;
++    case EntityStorageStat::kOffline  : {
++      CudaEntityFetchQueue::get_fetch_queue().enqueue_front(this);
++      pgincb_cv_.wait(lock);
++      return;
++    }
++    case EntityStorageStat::kTrans    : {
++      if (trans_stat_ == TransStat::kPgIn) {
++        pgincb_cv_.wait(lock);
++      } else if (trans_stat_ == TransStat::kPgOut) {
++        pgoutcb_cv_.wait(lock);
++        CudaEntityFetchQueue::get_fetch_queue().enqueue_front(this);
++        pgincb_cv_.wait(lock);
++      }
++      return;
++    } }
++}
++
++inline cudaEvent_t CudaEntityStorageImpl::create_event() {
++  return caching_allocator.device_allocator[device().index()]->create_event();
++}
++
++void CudaEntityStorageImpl::do_pageout(void* dst, void* src, size_t size, bool sync) {
++  #ifdef ATM_DEBUG_STORAGE 
++  c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                  "CudaEntityStorageImpl::do_pageout", 
++                                  "CUDA Pageout Memory" + std::to_string(size));
++  #endif
++  
++  swap(dst, src, size, cudaMemcpyDeviceToHost, pageout_stream_);
++  
++  if (!sync) {
++    EntityStorageRef_t entity_ptr = new EntityStorageRef(this->storage_->entity());
++    C10_CUDA_CHECK(cudaStreamAddCallback(pageout_stream_, __do_pageout_cb, (void*)entity_ptr, 0));  
++  } else {
++    C10_CUDA_CHECK(cudaEventSynchronize(event_));
++    #ifdef ATM_DEBUG_STORAGE 
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "CudaEntityStorageImpl::do_pageout", 
++                                    "Done CUDA Pageout Memory" + std::to_string(size));
++    #endif
++  }
++}
++
++void CudaEntityStorageImpl::do_pagein(void* dst, void* src, size_t size, bool sync) {
++  #ifdef ATM_DEBUG_STORAGE 
++  c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                  "CudaEntityStorageImpl::do_pagein", 
++                                  "CUDA Pagein Memory" + std::to_string(size));
++  #endif
++  block_ = caching_allocator.get_allocated_block(dst);
++  pagein_stream_ = entity_context.stream_in();
++  swap(dst, src, size, cudaMemcpyHostToDevice, pagein_stream_);
++  
++  if (!sync) {
++    EntityStorageRef_t entity_ptr = new EntityStorageRef(this->storage_->entity());
++    C10_CUDA_CHECK(cudaStreamAddCallback(pagein_stream_, __do_pagein_cb, (void*)entity_ptr, 0));
++  } else {
++    C10_CUDA_CHECK(cudaEventSynchronize(event_));
++    #ifdef ATM_DEBUG_STORAGE 
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "CudaEntityStorageImpl::do_pagein", 
++                                    "Done CUDA Pagein Memory" + std::to_string(size));
++    #endif
++  }
++}
++
+ // Returns whether to force all allocations to bypass the caching allocator and
+ // go straight to cudaMalloc.  This setting is useful when debugging GPU memory
+ // errors, since the caching allocator foils cuda-memcheck.
+@@ -1649,8 +1928,14 @@ static void uncached_delete(void* ptr) {
+ // NB: I decided not to fold this into THCCachingAllocator, because the latter
+ // has a lot more methods and it wasn't altogether clear that they should
+ // actually be publicly exposed
++
+ struct CudaCachingAllocator : public Allocator {
+   DataPtr allocate(size_t size) const override {
++    #ifdef ATM_DEBUG_3
++    c10::cuda::get_debug_log()->add_debug(c10::cuda::ATMLogLevel::DEBUG, 
++                                    "CudaCachingAllocator::allocate", 
++                                    "CUDA Allocated Memory " + std::to_string(size));
++    #endif
+     constexpr size_t one_exa_bytes = 1152921504606846976ULL;
+     TORCH_CHECK_WITH(
+         CUDAOutOfMemoryError,
+@@ -1678,6 +1963,9 @@ struct CudaCachingAllocator : public Allocator {
+       return &raw_delete;
+     }
+   }
++  c10::EntityStorageImpl* as_entity(c10::StorageImpl* storage) {
++    return new CudaEntityStorageImpl(storage);
++  }
+ };
+ 
+ CudaCachingAllocator device_allocator;
+@@ -1686,8 +1974,16 @@ Allocator* get(void) {
+   return &device_allocator;
+ }
+ 
+-void init(int device_count) {
+-  caching_allocator.init(device_count);
++void init(int device_count, c10::Allocator* host_allocator) {
++  caching_allocator.init(device_count, host_allocator);
++  // auto t1 = host_allocator->allocate(67108864); // trick pre-allocate 2G memory
++  // auto t2 = host_allocator->allocate(67108864);
++  // auto t3 = host_allocator->allocate(67108864);
++  // auto t4 = host_allocator->allocate(67108864);
++  // auto t5 = host_allocator->allocate(67108864);
++  // auto t6 = host_allocator->allocate(67108864);
++  // auto t7 = host_allocator->allocate(67108864);
++  // auto t8 = host_allocator->allocate(67108864);
+ }
+ 
+ void setMemoryFraction(double fraction, int device) {
+@@ -1763,6 +2059,34 @@ void notifyCaptureDestroy(int device, MempoolId_t mempool_id) {
+   caching_allocator.device_allocator[device]->notifyCaptureDestroy(mempool_id);
+ }
+ 
++// cuda entity methods 
++void createSwapEnv() {
++  CudaEntityEvictQueue::get_evict_queue().start_actions();
++  CudaEntityFetchQueue::get_fetch_queue().enable_queue();
++}
++
++void closeSwapEnv() {
++  CudaEntityEvictQueue::get_evict_queue().wait_and_stop_actions();
++  CudaEntityFetchQueue::get_fetch_queue().wait_and_stop_actions();
++}
++
++// clear prefetch queue
++void prefetchInit() {
++  CudaEntityFetchQueue::get_fetch_queue().wait_and_stop_actions();
++  CudaEntityFetchQueue::get_fetch_queue().enable_queue();
++}
++
++void prefetchAll() {
++  beforPrefetchWaitAll();
++  CudaEntityFetchQueue::get_fetch_queue().start_actions();
++}
++
++void beforPrefetchWaitAll() {
++  CudaEntityEvictQueue::get_evict_queue().wait_actions();
++  CudaEntityFetchQueue::get_fetch_queue().wait_actions();
++}
++
++
+ //
+ // In CUDA IPC, sender sends a tensor to receiver, getIpcDevPtr
+ // is called by the receiving process to map the CUDA memory from the sending
+diff --git a/c10/cuda/CUDAStream.cpp b/c10/cuda/CUDAStream.cpp
+index 36536674a12..c885f896e2e 100644
+--- a/c10/cuda/CUDAStream.cpp
++++ b/c10/cuda/CUDAStream.cpp
+@@ -48,6 +48,13 @@ static cudaStream_t low_priority_streams[C10_COMPILE_TIME_MAX_GPUS]
+ static cudaStream_t high_priority_streams[C10_COMPILE_TIME_MAX_GPUS]
+                                          [kStreamsPerPool];
+ 
++
++// ATM streams
++static constexpr unsigned int kAutoMemFlags = cudaStreamNonBlocking;
++static std::once_flag atm_device_flags[C10_COMPILE_TIME_MAX_GPUS];
++static std::atomic<uint32_t> atm_counters[C10_COMPILE_TIME_MAX_GPUS];
++static cudaStream_t atm_streams[C10_COMPILE_TIME_MAX_GPUS][kStreamsPerPool];
++
+ // Note [StreamId assignment]
+ // ~~~~~~~~~~~~~~~~~~~~~~~~~~
+ // How do we assign stream IDs?
+@@ -84,6 +91,7 @@ enum class StreamIdType : uint8_t {
+   LOW = 0x1,
+   HIGH = 0x2,
+   EXT = 0x3,
++  ATM = 0x4,
+ };
+ 
+ std::ostream& operator<<(std::ostream& stream, StreamIdType s) {
+@@ -100,6 +108,9 @@ std::ostream& operator<<(std::ostream& stream, StreamIdType s) {
+     case StreamIdType::EXT:
+       stream << "EXT";
+       break;
++    case StreamIdType::ATM:
++      stream << "ATM";
++      break;  
+     default:
+       stream << static_cast<uint8_t>(s);
+       break;
+@@ -170,6 +181,21 @@ static void initDeviceStreamState(DeviceIndex device_index) {
+   high_priority_counters[device_index] = 0;
+ }
+ 
++// Creates the ATM stream pools for the specified device
++// Warning: only call once per device!
++static void initDeviceAutoMemStreamState(DeviceIndex device_index) {
++  // Switches to the requested device so streams are properly associated
++  // with it.
++  CUDAGuard device_guard{device_index};
++
++  for (const auto i : c10::irange(kStreamsPerPool)) {
++    auto& stream = atm_streams[device_index][i];
++
++    C10_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, kAutoMemFlags));
++  }
++  atm_counters[device_index] = 0;
++}
++
+ // Init front-end to ensure initialization only occurs once
+ static void initCUDAStreamsOnce() {
+   // Inits default streams (once, globally)
+@@ -186,6 +212,11 @@ static void initCUDAStreamsOnce() {
+   }
+ }
+ 
++static void initAutoMemStreamsOnce(DeviceIndex device_index) {
++  // Inits default streams (once, globally)
++  std::call_once(atm_device_flags[device_index], initDeviceAutoMemStreamState, device_index);
++}
++
+ // Helper to verify the GPU index is valid
+ static inline void check_gpu(DeviceIndex device_index) {
+   TORCH_INTERNAL_ASSERT(device_index >= 0 && device_index < num_gpus);
+@@ -233,6 +264,8 @@ cudaStream_t CUDAStream::stream() const {
+       return high_priority_streams[device_index][si];
+     case StreamIdType::EXT:
+       return reinterpret_cast<cudaStream_t>(stream_id);
++    case StreamIdType::ATM:
++      return atm_streams[device_index][si];
+     default:
+       TORCH_INTERNAL_ASSERT(
+           0,
+@@ -298,6 +331,22 @@ void setCurrentCUDAStream(CUDAStream stream) {
+   current_streams[stream.device_index()] = stream.id();
+ }
+ 
++CUDAStream getCustomCUDAStream(DeviceIndex device_index) {
++  initCUDAStreamsOnce();
++  if (device_index == -1)
++    device_index = current_device();
++  check_gpu(device_index);
++  
++  initAutoMemStreamsOnce(device_index);
++  const auto stream_id = get_idx(atm_counters[device_index]);
++  return CUDAStream(
++      CUDAStream::UNCHECKED,
++      Stream(
++          Stream::UNSAFE,
++          c10::Device(DeviceType::CUDA, device_index),
++          makeStreamId(StreamIdType::ATM, stream_id)));
++}
++
+ std::ostream& operator<<(std::ostream& stream, const CUDAStream& s) {
+   return stream << s.unwrap();
+ }
+diff --git a/c10/cuda/CUDAStream.h b/c10/cuda/CUDAStream.h
+index 6d17136341c..97ea57f8122 100644
+--- a/c10/cuda/CUDAStream.h
++++ b/c10/cuda/CUDAStream.h
+@@ -236,6 +236,11 @@ TORCH_API CUDAStream getCurrentCUDAStream(DeviceIndex device_index = -1);
+  */
+ TORCH_API void setCurrentCUDAStream(CUDAStream stream);
+ 
++/**
++ * Get a new stream from the CUDA stream pool for Automem.
++ */
++TORCH_API CUDAStream getCustomCUDAStream(DeviceIndex device = -1);
++
+ C10_API std::ostream& operator<<(std::ostream& stream, const CUDAStream& s);
+ 
+ } // namespace cuda
+diff --git a/c10/cuda/CUDASwapQueues.cpp b/c10/cuda/CUDASwapQueues.cpp
+new file mode 100644
+index 00000000000..0f63818d9ec
+--- /dev/null
++++ b/c10/cuda/CUDASwapQueues.cpp
+@@ -0,0 +1,191 @@
++#include <c10/cuda/CUDASwapQueues.h>
++
++namespace c10 {
++namespace cuda {
++
++void CudaEntityTransferQueue::enqueue(EntityStorageImpl* impl) 
++{
++  std::unique_lock<std::mutex> lock(action_mutex_);
++  if (enable_flag_) { 
++    actions_.emplace_back(new EntityStorageRef(impl->storage_->entity()));
++    if (active_flag_) {
++      lock.unlock(); not_empty_cv_.notify_all();
++    }
++  }
++}
++
++EntityStorageRef_t CudaEntityTransferQueue::dequeue() 
++{
++  std::lock_guard<std::mutex> lock(action_mutex_);
++  if (actions_.empty()) 
++    return nullptr; 
++  auto impl_ref = actions_.front();
++  actions_.pop_front();
++  return impl_ref;
++}
++
++int CudaEntityTransferQueue::erase(EntityStorageImpl* impl) 
++{
++  std::lock_guard<std::mutex> lock(action_mutex_);
++  for (auto i = actions_.begin(); i != actions_.end(); i++)
++    if ((*i)->impl_->entity_id_ == impl->entity_id_) {
++      actions_.erase(i); return 0;
++    }
++  return 1;
++}
++
++CudaEntityEvictQueue& CudaEntityEvictQueue::get_evict_queue() 
++{
++  static CudaEntityEvictQueue evict_queue_;
++  return evict_queue_;
++}
++
++void CudaEntityEvictQueue::thread_do_entity_evict(CudaEntityEvictQueue& evict_queue) 
++{
++  std::unique_lock<std::mutex> lock(evict_queue.action_mutex_);
++  // unique working thread allowed
++  if (evict_queue.unique_flag_) return;
++    else evict_queue.unique_flag_ = true;
++  while (true) {
++    lock.unlock();
++    auto impl_ref = evict_queue.dequeue();
++    lock.lock();
++    while (impl_ref == nullptr && evict_queue.actions_.empty()) {
++      evict_queue.empty_cv_.notify_all();
++      evict_queue.not_empty_cv_.wait(lock);
++      lock.unlock();
++      impl_ref = evict_queue.dequeue();
++      lock.lock();
++      if (!evict_queue.active_flag_) goto post_evict_thread;
++    }
++    lock.unlock();
++    if (impl_ref->impl_.use_count() > 1 && !impl_ref->impl_->dirty_) {
++      impl_ref->impl_->pageout_internal_sync();
++      impl_ref->impl_->do_pageout_cb();
++    }
++    delete impl_ref;
++    lock.lock();
++  }
++  post_evict_thread:
++  // allow new unique thread to create 
++  evict_queue.unique_flag_ = false;
++}
++
++void CudaEntityEvictQueue::start_actions() 
++{
++  std::lock_guard<std::mutex> lock(action_mutex_);
++  if (active_flag_ || enable_flag_ || unique_flag_) return; 
++  active_flag_ = true;
++  enable_flag_ = true;
++  thread_do_entity_evict_ = std::thread(thread_do_entity_evict, std::ref(*this));
++  thread_do_entity_evict_.detach();
++}
++
++void CudaEntityEvictQueue::wait_and_stop_actions() 
++{
++  std::unique_lock<std::mutex> lock(action_mutex_);
++  enable_flag_ = false;
++  if (!active_flag_) return;
++  // there's running working thread, wait
++  if (!actions_.empty()) empty_cv_.wait(lock);
++  active_flag_ = false;
++  lock.unlock();
++  // must be a working thread wait not_empty_cv
++  not_empty_cv_.notify_all();
++}
++
++void CudaEntityEvictQueue::wait_actions() 
++{
++  std::unique_lock<std::mutex> lock(action_mutex_);
++  if (!active_flag_) return;
++  enable_flag_ = false;
++  if (!actions_.empty()) empty_cv_.wait(lock);
++  enable_flag_ = true;
++}
++
++
++void CudaEntityFetchQueue::enqueue_front(EntityStorageImpl* impl) 
++{
++  std::unique_lock<std::mutex> lock(action_mutex_);
++  if (enable_flag_) { 
++    actions_.emplace_front(new EntityStorageRef(impl->storage_->entity()));
++    if (active_flag_) {
++      lock.unlock(); not_empty_cv_.notify_all();
++    }
++  }
++}
++
++CudaEntityFetchQueue& CudaEntityFetchQueue::get_fetch_queue() 
++{
++  static CudaEntityFetchQueue fetch_queue_;
++  return fetch_queue_;
++}
++
++void CudaEntityFetchQueue::thread_do_entity_fetch(CudaEntityFetchQueue& fetch_queue) 
++{
++  std::unique_lock<std::mutex> lock(fetch_queue.action_mutex_);
++  // unique working thread allowed
++  if (fetch_queue.unique_flag_) return;
++    else fetch_queue.unique_flag_ = true;
++  while (true) {
++    lock.unlock();
++    auto impl_ref = fetch_queue.dequeue();
++    lock.lock();
++    while (impl_ref == nullptr && fetch_queue.actions_.empty()) {
++      fetch_queue.empty_cv_.notify_all();
++      fetch_queue.not_empty_cv_.wait(lock);
++      lock.unlock();
++      impl_ref = fetch_queue.dequeue();
++      lock.lock();
++      if (!fetch_queue.active_flag_) goto post_fetch_thread;
++    }
++    lock.unlock();
++    if (impl_ref->impl_.use_count() > 1 && !impl_ref->impl_->dirty_) {
++      impl_ref->impl_->pagein_internal_sync();
++      impl_ref->impl_->do_pagein_cb();
++    }
++    delete impl_ref;
++    lock.lock();
++  }
++  post_fetch_thread:
++  // allow new unique thread to create 
++  fetch_queue.unique_flag_ = false;
++}
++
++void CudaEntityFetchQueue::enable_queue()
++{
++  std::lock_guard<std::mutex> lock(action_mutex_);
++  enable_flag_ = true;
++}
++
++void CudaEntityFetchQueue::start_actions() 
++{
++  std::lock_guard<std::mutex> lock(action_mutex_);
++  if (active_flag_ || unique_flag_) return; 
++  active_flag_ = true;
++  thread_do_entity_fetch_ = std::thread(thread_do_entity_fetch, std::ref(*this));
++  thread_do_entity_fetch_.detach();
++}
++
++void CudaEntityFetchQueue::wait_and_stop_actions() 
++{
++  std::unique_lock<std::mutex> lock(action_mutex_);
++  enable_flag_ = false;
++  if (!active_flag_) return;
++  if (!actions_.empty()) empty_cv_.wait(lock);
++  active_flag_ = false;
++  lock.unlock();
++  not_empty_cv_.notify_all();
++}
++
++void CudaEntityFetchQueue::wait_actions() 
++{
++  std::unique_lock<std::mutex> lock(action_mutex_);
++  if (!active_flag_) return;
++  enable_flag_ = false;
++  if (!actions_.empty()) empty_cv_.wait(lock);
++  enable_flag_ = true;
++}
++
++} // cuda
++} // c10
+\ No newline at end of file
+diff --git a/c10/cuda/CUDASwapQueues.h b/c10/cuda/CUDASwapQueues.h
+new file mode 100644
+index 00000000000..8850911febb
+--- /dev/null
++++ b/c10/cuda/CUDASwapQueues.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <c10/cuda/CUDAException.h>
++#include <c10/cuda/CUDAFunctions.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/util/UniqueVoidPtr.h>
++#include <c10/util/flat_hash_map.h>
++#include <c10/util/irange.h>
++#include <c10/util/llvmMathExtras.h>
++
++#include <c10/core/EntityStorageImpl.h>
++#include <c10/core/StorageImpl.h>
++
++#include <mutex>
++#include <deque>
++#include <thread>
++
++namespace c10 {
++namespace cuda {
++struct CudaEntityTransferQueue {
++ public:
++  CudaEntityTransferQueue() : 
++          enable_flag_(false),
++          active_flag_(false),
++          unique_flag_(false) {}
++  void               enqueue(EntityStorageImpl* impl);
++  int                erase(EntityStorageImpl* impl);
++  EntityStorageRef_t dequeue();
++
++  virtual void       start_actions() = 0;
++  virtual void       wait_and_stop_actions() = 0;
++  virtual void       wait_actions() = 0;
++
++ protected:  
++  std::mutex                     action_mutex_;
++  // guarded by action_mutex
++  std::deque<EntityStorageRef_t> actions_;
++  std::atomic_bool               enable_flag_;
++  std::atomic_bool               active_flag_;
++  std::atomic_bool               unique_flag_;
++
++  std::condition_variable        not_empty_cv_;
++  std::condition_variable        empty_cv_;
++};
++
++struct CudaEntityEvictQueue final : public CudaEntityTransferQueue {
++ public:
++  CudaEntityEvictQueue() = default;
++  
++  static CudaEntityEvictQueue& get_evict_queue();
++  
++  void               start_actions() override;
++  void               wait_and_stop_actions() override;
++  void               wait_actions() override;
++  
++ private:
++  static void thread_do_entity_evict(CudaEntityEvictQueue& evict_queue);
++  std::thread thread_do_entity_evict_;
++};
++
++struct CudaEntityFetchQueue final : public CudaEntityTransferQueue {
++ public:
++  CudaEntityFetchQueue() = default;
++
++  static CudaEntityFetchQueue& get_fetch_queue();
++  
++  void               enqueue_front(EntityStorageImpl* impl);
++
++  void               enable_queue();
++  void               start_actions() override;
++  void               wait_and_stop_actions() override;
++  void               wait_actions() override;
++ private:  
++  static void thread_do_entity_fetch(CudaEntityFetchQueue& fetch_queue);
++  std::thread thread_do_entity_fetch_;
++};
++
++} // namespace cuda
++} // namespace c10
+\ No newline at end of file
+diff --git a/c10/util/IntrusiveList.h b/c10/util/IntrusiveList.h
+new file mode 100644
+index 00000000000..527cdf9e409
+--- /dev/null
++++ b/c10/util/IntrusiveList.h
+@@ -0,0 +1,70 @@
++#pragma once
++
++#include <c10/util/Exception.h>
++
++namespace c10 {
++
++// Element objects embed the IntrustiveListHook, which provides the
++// following properties:
++//   1. Insertion and removal operations are O(1) and require no
++//      memory allocation or deletion.
++//   2. Element destruction is valid and can be performed safely
++//      regardless of list membership.
++template <typename T>
++class IntrusiveListHook {
++ public:
++  IntrusiveListHook(T *elem) : elem_(elem) {
++    next_ = prev_ = this;
++  }
++  ~IntrusiveListHook() {
++    remove();
++  }
++
++  bool attached() const { return next_ != this; }
++  bool detached() const { return next_ == this; }
++
++  void insertbefore(IntrusiveListHook<T>* x) {
++    if (x->attached()) {
++      AT_ERROR("Double insertion of IntrusiveListHook");
++    }
++    x->prev_ = prev_;
++    x->next_ = this;
++    prev_->next_ = x;
++    prev_ = x;
++  }
++
++  bool remove() {
++    if (!attached()) return false;
++
++    prev_->next_ = next_;
++    next_->prev_ = prev_;
++    next_ = prev_ = this;
++    return true;
++  }
++  IntrusiveListHook<T>* next() const { return next_; }
++  IntrusiveListHook<T>* prev() const { return prev_; }
++  T* elem() const { return elem_; }
++
++ private:
++  IntrusiveListHook<T>* next_;
++  IntrusiveListHook<T>* prev_;
++  T* elem_;
++};
++
++template <typename T>
++class IntrusiveList {
++ public:
++  IntrusiveList() : anchor_(nullptr) {}
++  ~IntrusiveList() {}
++  bool empty() const { return anchor_.detached(); }
++  void append(IntrusiveListHook<T>* x) { anchor_.insertbefore(x); }
++  void prepend(IntrusiveListHook<T>* x) { anchor_.next()->insertbefore(x); }
++  IntrusiveListHook<T>* head() const { return anchor_.next(); }
++  IntrusiveListHook<T>* tail() const { return anchor_.prev(); }
++  const IntrusiveListHook<T>* terminator() const { return &anchor_; }
++
++ private:
++  IntrusiveListHook<T> anchor_;
++};
++
++} // end namespace c10
+diff --git a/tools/build_variables.bzl b/tools/build_variables.bzl
+index 605bf82f48f..f67c8622612 100644
+--- a/tools/build_variables.bzl
++++ b/tools/build_variables.bzl
+@@ -157,6 +157,7 @@ core_trainer_sources = [
+     "torch/csrc/autograd/saved_variable.cpp",
+     "torch/csrc/autograd/variable.cpp",
+     "torch/csrc/autograd/utils/warnings.cpp",
++    "torch/csrc/autograd/profiler_amem.cpp",
+     "torch/csrc/jit/frontend/name_mangler.cpp",
+     "torch/csrc/jit/ir/type_hashing.cpp",
+     "torch/csrc/jit/serialization/pickler.cpp",
+diff --git a/torch/_tensor.py b/torch/_tensor.py
+index 37383c17af2..258f46ca7b6 100644
+--- a/torch/_tensor.py
++++ b/torch/_tensor.py
+@@ -82,6 +82,13 @@ def _rebuild_from_type_v2(func, new_type, args, state):
+ # torch/__init__.py.in to add a type annotation for your method;
+ # otherwise, it will not show up in autocomplete.
+ class Tensor(torch._C._TensorBase):
++    def settensorUID(self, uid=-1):
++        self.tensor_uid = uid
++        self.amem_traced = True
++    def gettensorUID(self):
++        if 'tensor_uid' in dir(self):
++            return self.tensor_uid
++        return None
+     def __deepcopy__(self, memo):
+         if has_torch_function_unary(self):
+             return handle_torch_function(Tensor.__deepcopy__, (self,), self, memo)
+diff --git a/torch/csrc/autograd/engine.cpp b/torch/csrc/autograd/engine.cpp
+index 401f679d3d8..a02c8c13a80 100644
+--- a/torch/csrc/autograd/engine.cpp
++++ b/torch/csrc/autograd/engine.cpp
+@@ -22,6 +22,17 @@
+ #include <c10/util/ThreadLocal.h>
+ #include <c10/core/StreamGuard.h>
+ 
++/// ADDED BY HOME
++// #include<c10/core/PolicyMaker.h>
++#include <c10/cuda/CUDACachingAllocator.h>
++#include <c10/core/StorageImpl.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <ATen/native/Copy.h>
++#include <ATen/NativeFunctions.h>
++#include <ATen/Dispatch.h>
++#include <ATen/core/grad_mode.h>
++
++
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+@@ -38,6 +49,11 @@
+ #include <sstream>
+ #include <queue>
+ 
++#include <cstdio>
++#include <chrono>
++
++#include <torch/csrc/autograd/profiler_amem.h>
++
+ namespace torch { namespace autograd {
+ 
+ namespace {
+@@ -747,14 +763,52 @@ void validate_outputs(
+   }
+ }
+ 
++static void pre_call_function(
++  // std::shared_ptr<GraphTask>& graph_task,
++  Node *func) {
++  if (func == nullptr) return;
++  for (auto i = 0; i < func->prenodes_.size(); ++i) {
++    if (func->prenodes_[i] == nullptr) continue;
++    if (func->prenodes_[i]->self_policy_ <= 0) continue;
++    if (func->prenodes_[i]->self_policy_ == 1) {
++      pre_call_function(func->prenodes_[i].get());
++      std::shared_ptr<Node> pre_func = func->prenodes_[i]->getptr();
++      at::GradMode::set_enabled(false);
++      at::Tensor tensor_;
++      if (pre_func->prenodes_.size() > 1) {
++        if (pre_func->operation == 2)
++          tensor_ = at::add(pre_func->input_tensors_[0], pre_func->input_tensors_[1]);
++        else
++          tensor_ = at::cat(pre_func->input_tensors_, 1);
++      } else {
++        tensor_ = (pre_func->func_)(pre_func->input_tensors_[0]);
++      }
++      cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream());
++      at::GradMode::set_enabled(true);
++      std::swap(pre_func->storage_impl_->data_ptr(),tensor_.unsafeGetTensorImpl()->storage().unsafeGetStorageImpl()->data_ptr());
++      pre_func->self_policy_ = -1;
++    }
++    // else 
++  }
++}
++
+ static variable_list call_function(
+     std::shared_ptr<GraphTask>& graph_task,
+     Node* func,
+     InputBuffer& inputBuffer) {
++  
+   CheckpointValidGuard cpvguard(graph_task);
+   auto& fn = *func;
+   auto inputs =
+       call_pre_hooks(fn, InputBuffer::variables(std::move(inputBuffer)));
++  // printf("tensor entity: ");
++  // for (auto ii = 0; ii <  inputs.size(); ii++)
++    // printf("%ld", reinterpret_cast<int64_t>(inputs[ii].unsafeGetTensorImpl()->storage().unsafeGetStorageImpl()->data()));//entity().impl_->entity_id_);
++  // printf("\n");
++  // fflush(stdout);
++
++  // pre_call_function(func);
++
+ 
+   if (!graph_task->keep_graph_) {
+     fn.will_release_variables();
+@@ -763,6 +817,8 @@ static variable_list call_function(
+   const auto has_post_hooks = !fn.post_hooks().empty();
+   variable_list outputs;
+ 
++  // grad function execution, will profile here
++  auto start_grad_exe_time = std::chrono::high_resolution_clock::now();
+   if (has_post_hooks) {
+     // In functions/accumulate_grad.cpp, there is some logic to check the
+     // conditions under which the incoming gradient can be stolen directly
+@@ -784,7 +840,11 @@ static variable_list call_function(
+   } else {
+     outputs = fn(std::move(inputs));
+   }
+-
++  auto elapsed_grad_exe_time = std::chrono::high_resolution_clock::now() - start_grad_exe_time;
++  int32_t elapsed_grad_exe_microseconds = 
++    std::chrono::duration_cast<std::chrono::microseconds>(elapsed_grad_exe_time).count();
++  torch::automem::GetAutoMemProfiler()->grad_execution_time[fn.self_id_] = elapsed_grad_exe_microseconds;
++  
+   validate_outputs(fn.next_edges(), outputs, [&](const std::string& msg) {
+     std::ostringstream ss;
+     ss << "Function "  << fn.name() << " returned an " << msg;
+@@ -834,7 +894,7 @@ void Engine::evaluate_function(
+       return;
+     }
+   }
+-
++  
+   auto outputs = call_function(graph_task, func, inputs);
+ 
+   auto& fn = *func;
+diff --git a/torch/csrc/autograd/function.cpp b/torch/csrc/autograd/function.cpp
+index 83509c9dae1..35eaf924987 100644
+--- a/torch/csrc/autograd/function.cpp
++++ b/torch/csrc/autograd/function.cpp
+@@ -14,6 +14,8 @@
+ #include <utility>
+ #include <vector>
+ 
++static int32_t global_fn_uid_count = 0;
++
+ namespace torch { namespace autograd {
+ 
+ // The current evaluating node. This is useful to assign the current node as a
+@@ -31,6 +33,59 @@ NodeGuard::~NodeGuard() {
+   current_evaluating_node = std::move(last_evaluating_node_);
+ }
+ 
++Node::Node(uint64_t sequence_nr)
++      : sequence_nr_(sequence_nr) {
++  // set id global
++  next_edges_ = edge_list();
++
++  self_id_ = global_fn_uid_count++;
++
++  for (const Edge& edge: next_edges_) {
++    update_topological_nr(edge);
++  }
++
++  if (AnomalyMode::is_enabled()) {
++    metadata()->store_stack();
++
++    // If anomaly mode is enabled and graph is constructed, then assign the
++    // currently evaluating node as the parent of this node.
++    // A parent is a Node where this Node is created.
++    // We are tracking the parents to track multiple backward operations.
++    assign_parent();
++  }
++
++  // Store the thread_id of the forward operator.
++  // See NOTE [ Sequence Numbers ]
++  thread_id_ = at::RecordFunction::currentThreadId();
++}
++
++Node::Node(
++      uint64_t sequence_nr,
++      edge_list&& next_edges)
++      : sequence_nr_(sequence_nr),
++      next_edges_(std::move(next_edges)) {
++  // set id global
++  self_id_ = global_fn_uid_count++;
++
++  for (const Edge& edge: next_edges_) {
++    update_topological_nr(edge);
++  }
++
++  if (AnomalyMode::is_enabled()) {
++    metadata()->store_stack();
++
++    // If anomaly mode is enabled and graph is constructed, then assign the
++    // currently evaluating node as the parent of this node.
++    // A parent is a Node where this Node is created.
++    // We are tracking the parents to track multiple backward operations.
++    assign_parent();
++  }
++
++  // Store the thread_id of the forward operator.
++  // See NOTE [ Sequence Numbers ]
++  thread_id_ = at::RecordFunction::currentThreadId();
++}
++
+ void Node::assign_parent() {
+   metadata()->assign_parent(current_evaluating_node);
+ }
+diff --git a/torch/csrc/autograd/function.h b/torch/csrc/autograd/function.h
+index dfeb1c973df..8abcac17a9f 100644
+--- a/torch/csrc/autograd/function.h
++++ b/torch/csrc/autograd/function.h
+@@ -22,21 +22,26 @@
+ #include <string>
+ #include <utility>
+ #include <vector>
++#include <cstdint>
+ 
+ C10_CLANG_DIAGNOSTIC_PUSH()
+ #if C10_CLANG_HAS_WARNING("-Wshorten-64-to-32")
+ C10_CLANG_DIAGNOSTIC_IGNORE("-Wshorten-64-to-32")
+ #endif
+ 
++// extern int32_t global_fn_uid_count;
++
+ namespace torch { namespace autograd {
+ 
+ struct Edge;
++struct Node;
+ struct FunctionPostHook;
+ struct FunctionPreHook;
+ 
+ using tensor_list = std::vector<at::Tensor>;
+ using variable_list = std::vector<Variable>;
+ using edge_list = std::vector<Edge>;
++using node_list = std::vector<std::shared_ptr<Node>>;
+ using saved_variable_list = std::vector<SavedVariable>;
+ using IndexRange = std::pair<size_t, size_t>;
+ 
+@@ -102,34 +107,74 @@ class NodeGuard {
+ // guarantees* w.r.t. the ordering of `C` relative to `A` or `B`.
+ // See NOTE [ Sequence Number] for more details on the usages of sequence number.
+ //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++// struct TORCH_API multiple_inputs : std::enable_shared_from_this<multiple_inputs> {
++//     std::vector<at::Tensor> input_tensors;
++//     //std::vector<int> com_and_trans;
++//     //std::vector<std::function<at::Tensor(const at::Tensor&)>> func 
++//     std::vector<std::shared_ptr<Node>> pre_nodes;
++//     //std::vector<c10::StorageImpl*> storage_impl_s;
++//     //std::vector<c10::DataPtr> dataptrs;
++//     struct timeval start_, end_;
++// };
++
++
++
+ struct TORCH_API Node : std::enable_shared_from_this<Node> {
+  public:
++  /// Properties Added By HOME
++  int32_t self_id_ = -1;
++  c10::StorageImpl* storage_impl_ = nullptr;
++  int32_t self_policy_ = 0;
++
++  bool is_cat_ = false; // Not used
++  std::vector<int32_t> id_prenodes_;
++  node_list prenodes_;
++  tensor_list input_tensors_;
++  int32_t operation = 1;
++  /// IDK Maybe Added by CSWAP
++  int32_t dim_size_;
++  int32_t block_size_;
++  std::function<at::Tensor(const at::Tensor&)> func_; // forward function
++  std::function<at::Tensor()> forwardfunc_; 
++
++  std::shared_ptr<Node> getptr() { return shared_from_this(); }
++
+   /// Construct a new `Node` with the given `next_edges`
+   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+-  explicit Node(
++    explicit Node(
++      uint64_t sequence_nr);
++    
++    explicit Node(
+       uint64_t sequence_nr,
+-      edge_list&& next_edges = edge_list())
+-      : sequence_nr_(sequence_nr),
+-      next_edges_(std::move(next_edges)) {
+-
+-    for (const Edge& edge: next_edges_) {
+-      update_topological_nr(edge);
+-    }
+-
+-    if (AnomalyMode::is_enabled()) {
+-      metadata()->store_stack();
+-
+-      // If anomaly mode is enabled and graph is constructed, then assign the
+-      // currently evaluating node as the parent of this node.
+-      // A parent is a Node where this Node is created.
+-      // We are tracking the parents to track multiple backward operations.
+-      assign_parent();
+-    }
+-
+-    // Store the thread_id of the forward operator.
+-    // See NOTE [ Sequence Numbers ]
+-    thread_id_ = at::RecordFunction::currentThreadId();
+-  }
++      edge_list && next_edges);
++
++  // explicit Node(
++  //     uint64_t sequence_nr,
++  //     edge_list&& next_edges= edge_list())
++  //     : sequence_nr_(sequence_nr),
++  //     next_edges_(std::move(next_edges)) {
++  //   // set id global
++  //   self_id_ = global_fn_uid_count++;
++
++  //   for (const Edge& edge: next_edges_) {
++  //     update_topological_nr(edge);
++  //   }
++
++  //   if (AnomalyMode::is_enabled()) {
++  //     metadata()->store_stack();
++
++  //     // If anomaly mode is enabled and graph is constructed, then assign the
++  //     // currently evaluating node as the parent of this node.
++  //     // A parent is a Node where this Node is created.
++  //     // We are tracking the parents to track multiple backward operations.
++  //     assign_parent();
++  //   }
++
++  //   // Store the thread_id of the forward operator.
++  //   // See NOTE [ Sequence Numbers ]
++  //   thread_id_ = at::RecordFunction::currentThreadId();
++  // }
+ 
+   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+   explicit Node(edge_list&& next_edges = edge_list())
+diff --git a/torch/csrc/autograd/init.cpp b/torch/csrc/autograd/init.cpp
+index 2a5ec74f26e..41038e4c8f5 100644
+--- a/torch/csrc/autograd/init.cpp
++++ b/torch/csrc/autograd/init.cpp
+@@ -28,6 +28,9 @@
+ #include <set>
+ #include <unordered_set>
+ 
++#include <torch/csrc/autograd/profiler_amem.h>
++
++
+ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject *unused) {
+   using namespace torch::autograd::profiler;
+   using namespace torch::profiler::impl;
+@@ -653,6 +656,24 @@ static PyObject * get_torch_function_mode(PyObject* _unused, PyObject* _unused2)
+   END_HANDLE_TH_ERRORS
+ }
+ 
++static PyObject * automem_profiler_init(PyObject* _unused, PyObject* _unused2) {
++  HANDLE_TH_ERRORS
++  torch::automem::GetAutoMemProfiler()->init();
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++static PyObject * automem_profiler_get_profile(PyObject* _unused, PyObject* _unused2) {
++  HANDLE_TH_ERRORS
++  auto profiler = torch::automem::GetAutoMemProfiler();
++  PyObject* ret_dict = PyDict_New(); 
++  for (auto const& el : profiler->grad_execution_time) {
++    PyDict_SetItem(ret_dict, THPUtils_packInt32(el.first), THPUtils_packInt32(el.second));
++  }
++  return ret_dict;
++  END_HANDLE_TH_ERRORS
++}
++
+ // autograd methods on torch._C
+ static PyMethodDef methods[] = { // NOLINT
+   {"_set_grad_enabled", set_grad_enabled, METH_O, nullptr},
+@@ -679,6 +700,10 @@ static PyMethodDef methods[] = { // NOLINT
+   {"_get_torch_dispatch_mode", get_torch_dispatch_mode, METH_NOARGS, nullptr},
+   {"_set_torch_function_mode", set_torch_function_mode, METH_O, nullptr},
+   {"_get_torch_function_mode", get_torch_function_mode, METH_NOARGS, nullptr},
++
++  {"automem_profiler_init", automem_profiler_init, METH_NOARGS, nullptr},
++  {"automem_profiler_get_profile", automem_profiler_get_profile, METH_NOARGS, nullptr},
++  
+   {nullptr, nullptr, 0, nullptr}
+ };
+ 
+diff --git a/torch/csrc/autograd/profiler_amem.cpp b/torch/csrc/autograd/profiler_amem.cpp
+new file mode 100644
+index 00000000000..3331c37ab2d
+--- /dev/null
++++ b/torch/csrc/autograd/profiler_amem.cpp
+@@ -0,0 +1,14 @@
++
++// #include <ATen/ATen.h>
++// #include <c10/core/StorageImpl.h>
++//#include <ATen/native/Copy.h>
++//#include <ATen/Dispatch.h>
++//#include <ATen/NativeFunctions.h>
++#include <torch/csrc/autograd/profiler_amem.h>
++
++namespace torch{ namespace automem {
++
++static AMemProfiler amem_profiler;
++TORCH_API AMemProfiler* GetAutoMemProfiler() { return &amem_profiler; }
++
++}}
+diff --git a/torch/csrc/autograd/profiler_amem.h b/torch/csrc/autograd/profiler_amem.h
+new file mode 100644
+index 00000000000..b275d1ced48
+--- /dev/null
++++ b/torch/csrc/autograd/profiler_amem.h
+@@ -0,0 +1,25 @@
++#pragma once
++// #include <torch/csrc/python_headers.h>
++#include <vector>
++#include <utility>
++#include <memory>
++#include <map>
++#include <cstdint>
++#include <torch/csrc/autograd/function.h>
++// #include <torch/csrc/utils/object_ptr.h>
++// #include <torch/csrc/Exceptions.h>
++
++namespace torch{ namespace automem{
++    
++struct AMemProfiler{
++public:
++  AMemProfiler() = default;
++  void init() { grad_execution_time.clear(); }
++  std::map<int32_t,int32_t> grad_execution_time;
++private:
++  int32_t grad_fn_nums;
++};
++
++TORCH_API AMemProfiler* GetAutoMemProfiler();
++
++}}
+diff --git a/torch/csrc/autograd/python_cpp_function.cpp b/torch/csrc/autograd/python_cpp_function.cpp
+index 3ae46289fb8..95e5ea2fd28 100644
+--- a/torch/csrc/autograd/python_cpp_function.cpp
++++ b/torch/csrc/autograd/python_cpp_function.cpp
+@@ -160,6 +160,12 @@ PyObject* THPCppFunction_name(PyObject* self, PyObject *noargs) {
+   return THPUtils_packString(fn.name());
+ }
+ 
++PyObject* THPCppFunction_fn_uid(THPCppFunction* self, void *_unused) {
++  auto uid = THPUtils_packInt32(self->cdata->self_id_);
++  return uid;
++}
++
++
+ // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables,modernize-avoid-c-arrays)
+ static struct PyMethodDef default_methods[] = {
+   THP_FUNCTION_DEFAULT_METHODS,
+diff --git a/torch/csrc/autograd/python_cpp_function.h b/torch/csrc/autograd/python_cpp_function.h
+index fb1ba9c1a27..dbc78a7109f 100644
+--- a/torch/csrc/autograd/python_cpp_function.h
++++ b/torch/csrc/autograd/python_cpp_function.h
+@@ -38,7 +38,8 @@ PyObject* CppFunction_pynew(PyTypeObject *type, PyObject *args, PyObject *kwds)
+ #define THP_FUNCTION_DEFAULT_PROPERTIES \
+   {(char*)"next_functions", (getter)THPCppFunction_next_functions, nullptr, nullptr, nullptr}, \
+   {(char*)"requires_grad", (getter)THPCppFunction_requires_grad, nullptr, nullptr, nullptr}, \
+-  {(char*)"metadata", (getter)THPCppFunction_metadata, nullptr, nullptr, nullptr}
++  {(char*)"metadata", (getter)THPCppFunction_metadata, nullptr, nullptr, nullptr}, \
++  {(char*)"fn_uid", (getter)THPCppFunction_fn_uid, nullptr, nullptr, nullptr}
+ 
+ PyObject* THPCppFunction_next_functions(THPCppFunction* self, PyObject* hook);
+ PyObject* THPCppFunction_metadata(THPCppFunction *self, void *_unused);
+@@ -46,6 +47,7 @@ PyObject* THPCppFunction_requires_grad(THPCppFunction* self, void *_unused);
+ PyObject* THPCppFunction_register_hook_dict(PyObject* self, PyObject* _var);
+ PyObject* THPCppFunction_register_hook(PyObject* self, PyObject* hook);
+ PyObject* THPCppFunction_name(PyObject* self, PyObject *noargs);
++PyObject* THPCppFunction_fn_uid(THPCppFunction* self, void *_unused);
+ 
+ PyTypeObject* _initFunctionPyTypeObject(PyTypeObject& type, const char* name,
+   PyGetSetDef* function_properties, PyMethodDef* function_methods);
+diff --git a/torch/csrc/autograd/python_function.cpp b/torch/csrc/autograd/python_function.cpp
+index 43911fe18b9..c4cba21d073 100644
+--- a/torch/csrc/autograd/python_function.cpp
++++ b/torch/csrc/autograd/python_function.cpp
+@@ -186,6 +186,10 @@ auto PyNode::name() const -> std::string {
+   return name;
+ }
+ 
++// auto PyNode::getuid() const -> int32_t {
++//   return self_id_;
++// }
++
+ }} // namespace torch::autograd
+ 
+ // Traverse and clear are required for supporting Python's GC cycle handling.
+@@ -937,6 +941,22 @@ PyObject *THPFunction_metadata(THPFunction *self, void *_unused)
+   END_HANDLE_TH_ERRORS
+ }
+ 
++PyObject *THPFunction_fn_uid(THPFunction *self, void *_unused)
++{
++  HANDLE_TH_ERRORS
++  auto cdata = self->cdata.lock();
++  TORCH_CHECK(cdata,
++    "You attempted to access the uid of a custom autograd function "
++    "but the underlying PyNode has already been deallocated.  The most likely "
++    "reason this occurred is because you assigned x.grad_fn to a local variable "
++    "and then let the original variable get deallocated.  Don't do that!  If "
++    "you really have no way of restructuring your code so this is the case, "
++    "please file an issue reporting that you are affected by this."); 
++  auto uid = THPUtils_packInt32(cdata->self_id_);
++  return uid;
++  END_HANDLE_TH_ERRORS
++}
++
+ typedef PyObject *(*getter)(PyObject *, void *);
+ typedef int (*setter)(PyObject *, PyObject *, void *);
+ 
+@@ -997,6 +1017,7 @@ static struct PyGetSetDef THPFunction_properties[] = {
+   {"requires_grad", getRequiresGrad, nullptr, nullptr, nullptr},
+   {"metadata", (getter)THPFunction_metadata, nullptr, nullptr, nullptr},
+   {"materialize_grads", nullptr, (setter)THPFunction_set_materialize_grads, nullptr, nullptr},
++  {"fn_uid", (getter)THPFunction_fn_uid, nullptr, nullptr, nullptr},
+   {nullptr}
+ };
+ 
+diff --git a/torch/csrc/autograd/python_function.h b/torch/csrc/autograd/python_function.h
+index 77147b090fb..8e17ba2bab9 100644
+--- a/torch/csrc/autograd/python_function.h
++++ b/torch/csrc/autograd/python_function.h
+@@ -30,7 +30,7 @@ struct PyNode : public Node {
+   void release_variables() override;
+   std::string name() const override;
+   bool is_traceable() override;
+-
++  // int32_t getuid() const override;
+   // THPFunction this Function is wrapping.  Owning!
+   PyObject* obj;
+ 
+diff --git a/torch/csrc/cuda/Module.cpp b/torch/csrc/cuda/Module.cpp
+index 63d5fc7eb1b..cbb695c5983 100644
+--- a/torch/csrc/cuda/Module.cpp
++++ b/torch/csrc/cuda/Module.cpp
+@@ -8,6 +8,7 @@
+ #include <ATen/cuda/Sleep.h>
+ #include <ATen/cuda/detail/CUDAHooks.h>
+ #include <ATen/cuda/jiterator.h>
++#include <c10/cuda/ATMConfig.h>
+ #ifdef USE_NCCL
+ #include <torch/csrc/cuda/python_nccl.h>
+ #endif
+@@ -509,6 +510,98 @@ PyObject * THCPModule_memorySnapshot(PyObject *_unused, PyObject *noargs)
+   END_HANDLE_TH_ERRORS
+ }
+ 
++// NOTE Add Here
++
++PyObject * THCPModule_createSwapEnv(PyObject *_unused, PyObject *noargs)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::CUDACachingAllocator::createSwapEnv();
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++PyObject * THCPModule_closeSwapEnv(PyObject *_unused, PyObject *noargs)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::CUDACachingAllocator::closeSwapEnv();
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++PyObject * THCPModule_prefetchInit(PyObject *_unused, PyObject *noargs)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::CUDACachingAllocator::prefetchInit();
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
++PyObject * THCPModule_prefetchAll(PyObject *_unused, PyObject *noargs)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::CUDACachingAllocator::prefetchAll();
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
++PyObject * THCPModule_beforPrefetchWaitAll(PyObject *_unused, PyObject *noargs)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::CUDACachingAllocator::beforPrefetchWaitAll();
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
++PyObject *THCPModule_getC10DebugATM(PyObject *_unused, PyObject * arg)
++{
++  HANDLE_TH_ERRORS
++  auto debug_log = c10::cuda::get_debug_log();
++  std::string debug_output = "";
++  int iter = 0;
++  for (auto debug_log_el : debug_log->get_debug(c10::cuda::ATMLogLevel::DEBUG)) {
++    debug_output += "[" + std::to_string(++iter) + "]" + debug_log_el.first + "|=>|" + debug_log_el.second + "\n";
++  }
++  return THPUtils_packString(debug_output);
++  // if (c10::cuda::CUDACachingAllocator::userEnabledLMS()) Py_RETURN_TRUE;
++  // else Py_RETURN_FALSE;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_clearC10DebugATM(PyObject *_unused, PyObject * arg)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::get_debug_log()->clear_debug(c10::cuda::ATMLogLevel::DEBUG);
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_getC10StorageImplProfileATM(PyObject *_unused, PyObject * arg)
++{
++  HANDLE_TH_ERRORS
++  auto impl_profile = c10::cuda::get_impl_profile();
++  std::string profile_output = "";
++  int iter = 0;
++  for (auto impl_profile_el : impl_profile->get_storage_profile()) {
++    profile_output += std::to_string(impl_profile_el.first) + "," +
++                      std::to_string(impl_profile_el.second.data_ptr_) + "," +
++                      std::to_string(impl_profile_el.second.life_start_) + "," +
++                      std::to_string(impl_profile_el.second.life_end_) + "," +
++                      std::to_string(impl_profile_el.second.size_);
++    for (auto access_el : impl_profile_el.second.access_seq_)
++      profile_output += "," + std::to_string(access_el);
++    profile_output += "\n";
++  }
++  return THPUtils_packString(profile_output);
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_clearC10StorageImplProfileATM(PyObject *_unused, PyObject * arg)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::get_impl_profile()->clear_storage_profile();
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++
+ PyObject * THCPModule_cudaSetSyncDebugMode(PyObject * _unused, PyObject * arg){
+   HANDLE_TH_ERRORS
+   TORCH_WARN_ONCE("Synchronization debug mode is a prototype feature and does not yet detect all " \
+@@ -681,6 +774,16 @@ static struct PyMethodDef _THCPModule_methods[] = {
+   {"_cuda_resetAccumulatedMemoryStats", THCPModule_resetAccumulatedMemoryStats, METH_O, nullptr},
+   {"_cuda_resetPeakMemoryStats", THCPModule_resetPeakMemoryStats, METH_O,  nullptr},
+   {"_cuda_memorySnapshot", THCPModule_memorySnapshot, METH_NOARGS, nullptr},
++  // NOTE: Add cuda function here
++  {"_cuda_createSwapEnv", THCPModule_createSwapEnv, METH_NOARGS, nullptr},
++  {"_cuda_closeSwapEnv", THCPModule_closeSwapEnv, METH_NOARGS, nullptr},
++  {"_cuda_prefetchInit", THCPModule_prefetchInit, METH_NOARGS, nullptr},
++  {"_cuda_prefetchAll", THCPModule_prefetchAll, METH_NOARGS, nullptr},
++  {"_cuda_beforPrefetchWaitAll", THCPModule_beforPrefetchWaitAll, METH_NOARGS, nullptr},
++  {"_cuda_getStorageImplProfileATM", THCPModule_getC10StorageImplProfileATM, METH_NOARGS, nullptr},
++  {"_cuda_clearStorageImplProfileATM", THCPModule_clearC10StorageImplProfileATM, METH_NOARGS, nullptr},
++  {"_cuda_getDebugATM", THCPModule_getC10DebugATM, METH_NOARGS, nullptr},
++  {"_cuda_clearDebugATM", THCPModule_clearC10DebugATM, METH_NOARGS, nullptr},
+   {"_cuda_cudaHostAllocator", THCPModule_cudaHostAllocator, METH_NOARGS, nullptr},
+   {"_cuda_cudaCachingAllocator_raw_alloc", THCPModule_cudaCachingAllocator_raw_alloc, METH_VARARGS, nullptr},
+   {"_cuda_cudaCachingAllocator_raw_delete", THCPModule_cudaCachingAllocator_raw_delete, METH_O, nullptr},
+diff --git a/torch/cuda/memory.py b/torch/cuda/memory.py
+index a4b7b1d956c..0942014330a 100644
+--- a/torch/cuda/memory.py
++++ b/torch/cuda/memory.py
+@@ -12,7 +12,8 @@ __all__ = ["caching_allocator_alloc", "caching_allocator_delete", "set_per_proce
+            "reset_peak_memory_stats", "reset_max_memory_allocated", "reset_max_memory_cached",
+            "memory_allocated", "max_memory_allocated", "memory_reserved", "max_memory_reserved",
+            "memory_cached", "max_memory_cached", "memory_snapshot", "memory_summary", "list_gpu_processes",
+-           "mem_get_info"]
++           "mem_get_info", "get_debug_atm", "clear_debug_atm", "get_storageimpl_profile", "clear_storageimpl_profile",
++           "prefetch_init", "prefetch_all", "before_prefetch_wait_all", "create_swap_env", "close_swap_env"]
+ 
+ def _host_allocator():
+     _lazy_init()
+@@ -590,3 +591,33 @@ def mem_get_info(device: Union[Device, int] = None) -> int:
+         device = torch.cuda.current_device()
+     device = _get_device_index(device)
+     return torch.cuda.cudart().cudaMemGetInfo(device)
++
++def get_debug_atm():
++    r"""Returns the debug infomation ATM"""
++    return torch._C._cuda_getDebugATM()
++def clear_debug_atm():
++    r"""clear the debug infomation ATM"""
++    return torch._C._cuda_clearDebugATM()
++def get_storageimpl_profile():
++    r"""Returns the impl profile infomation ATM"""
++    return torch._C._cuda_getStorageImplProfileATM()
++
++def clear_storageimpl_profile():
++    r"""clear the impl profile infomation ATM"""
++    return torch._C._cuda_clearStorageImplProfileATM()
++
++def create_swap_env():
++    return torch._C._cuda_createSwapEnv()
++def close_swap_env():
++    return torch._C._cuda_closeSwapEnv()
++
++
++def prefetch_init():
++    r"""prefetch init"""
++    return torch._C._cuda_prefetchInit()
++def prefetch_all():
++    r"""prefetch all storage"""
++    return torch._C._cuda_prefetchAll()
++def before_prefetch_wait_all():
++    r"""wait all transfer done"""
++    return torch._C._cuda_beforPrefetchWaitAll()
+\ No newline at end of file
