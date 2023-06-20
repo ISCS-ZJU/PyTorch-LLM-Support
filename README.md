@@ -28,7 +28,7 @@ Torchvision compiling: https://github.com/pytorch/vision
 
 ## Examples
 
-We show the examples in ([DenseNet with CIFAR10](https://github.com/Nayaco/mahoshojos-large-model-support/tree/main/examples)))
+We show the examples in ([DenseNet with CIFAR10](https://github.com/Nayaco/mahoshojos-large-model-support/tree/main/examples))
 
 ## Authors
 
