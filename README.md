@@ -24,9 +24,11 @@ git am ../mlms/patches/pytorch_v1.12.0_large_model_support.patch   
 
 Patch installation is completed according to the official Pytorch warehouse documentation compiled software, Pytorch official warehouse address: https://github.com/pytorch/pytorch/tree/v1.12.0
 
+Torchvision compiling: https://github.com/pytorch/vision
+
 ## Examples
 
-We show the examples in ([DenseNet with CIFAR10](https://github.com/IBM/pytorch-large-model-support](https://github.com/Nayaco/mahoshojos-large-model-support/tree/main/examples)))
+We show the examples in ([DenseNet with CIFAR10](https://github.com/IBM/pytorch-large-model-support](https://github.com/Nayaco/mahoshojos-large-model-support/tree/main/examples))
 
 ## Authors
 
