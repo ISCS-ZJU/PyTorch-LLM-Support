@@ -27,6 +27,6 @@ We show the examples in ([DenseNet with CIFAR10](https://github.com/IBM/pytorch-
 
 ## Authors
 
-Wenjie Zhang : [Git Home page](https://github.com/Nayaco/mahoshojos-large-model-support/tree/main))
+Wenjie Zhang (Master Student from Zhejiang University) : [Git Home page](https://github.com/Nayaco/mahoshojos-large-model-support/tree/main)
 
-Editor & co-author: Ping Chen from Zhejiang University
+Editor & co-author: Ping Chen (Phd Student from Zhejiang University)
